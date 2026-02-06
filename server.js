@@ -55,10 +55,14 @@ app.get('/api/check-balance/:wallet', async (req, res) => {
         );
         
         const balance = await connection.getTokenAccountBalance(tokenAccount);
-        const chumBalance = parseInt(balance.value.amount) / 1e9;
+        
+        // Use the actual decimals from the token response
+        const chumBalance = balance.value.uiAmount || 0;
         
         const eligible = chumBalance >= MIN_HOLD_REQUIREMENT;
         const deficit = Math.max(0, MIN_HOLD_REQUIREMENT - chumBalance);
+        
+        console.log(`Balance check for ${req.params.wallet}: ${chumBalance} $CHUM (decimals: ${balance.value.decimals})`);
         
         res.json({
             wallet: req.params.wallet,
@@ -66,6 +70,7 @@ app.get('/api/check-balance/:wallet', async (req, res) => {
             required: MIN_HOLD_REQUIREMENT,
             eligible,
             deficit,
+            decimals: balance.value.decimals,
             message: eligible 
                 ? `✅ Eligible! You hold ${chumBalance.toFixed(2)} $CHUM`
                 : `❌ Need ${deficit.toFixed(2)} more $CHUM`
@@ -99,7 +104,7 @@ app.post('/api/verify-eligibility', async (req, res) => {
         );
         
         const balance = await connection.getTokenAccountBalance(tokenAccount);
-        const chumBalance = parseInt(balance.value.amount) / 1e9;
+        const chumBalance = balance.value.uiAmount || 0;
         
         if (chumBalance < MIN_HOLD_REQUIREMENT) {
             return res.json({
@@ -157,7 +162,7 @@ app.post('/api/claim-rewards', async (req, res) => {
         );
         
         const balance = await connection.getTokenAccountBalance(tokenAccount);
-        const chumBalance = parseInt(balance.value.amount) / 1e9;
+        const chumBalance = balance.value.uiAmount || 0;
         
         if (chumBalance < MIN_HOLD_REQUIREMENT) {
             return res.json({
