@@ -242,9 +242,16 @@ app.get('/api/admin/sessions', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🦈 BullShark P2E API running on port ${PORT}`);
-    console.log(`📡 RPC: ${RPC_URL}`);
-    console.log(`💎 Min Hold: ${MIN_HOLD_REQUIREMENT} $CHUM`);
-    console.log(`🎮 Conversion: ${POINTS_PER_CHUM} points = 1 $CHUM`);
-});
+
+// Only start server if not in Vercel serverless environment
+if (process.env.VERCEL !== '1') {
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`🦈 BullShark P2E API running on port ${PORT}`);
+        console.log(`📡 RPC: ${RPC_URL}`);
+        console.log(`💎 Min Hold: ${MIN_HOLD_REQUIREMENT} $CHUM`);
+        console.log(`🎮 Conversion: ${POINTS_PER_CHUM} points = 1 $CHUM`);
+    });
+}
+
+// Export for Vercel serverless
+module.exports = app;
