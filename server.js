@@ -14,15 +14,18 @@ const CHUM_MINT = new PublicKey(process.env.CHUM_MINT);
 const MIN_HOLD_REQUIREMENT = 25000; // 25K $CHUM
 const POINTS_PER_CHUM = 3000;
 
-// Load authority keypair
-let authority;
+// Load authority keypair (optional for now)
+let authority = null;
 try {
-    const keypairData = JSON.parse(process.env.AUTHORITY_KEYPAIR);
-    authority = Keypair.fromSecretKey(new Uint8Array(keypairData));
-    console.log('✅ Authority loaded:', authority.publicKey.toString());
+    if (process.env.AUTHORITY_KEYPAIR) {
+        const keypairData = JSON.parse(process.env.AUTHORITY_KEYPAIR);
+        authority = Keypair.fromSecretKey(new Uint8Array(keypairData));
+        console.log('✅ Authority loaded:', authority.publicKey.toString());
+    } else {
+        console.log('⚠️ No authority keypair - P2E reward claiming disabled');
+    }
 } catch (error) {
-    console.error('❌ Failed to load authority keypair');
-    process.exit(1);
+    console.error('⚠️ Failed to load authority keypair - P2E reward claiming disabled');
 }
 
 const connection = new Connection(RPC_URL, 'confirmed');
@@ -36,8 +39,9 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        authority: authority.publicKey.toString(),
-        minHold: MIN_HOLD_REQUIREMENT
+        authority: authority ? authority.publicKey.toString() : 'Not configured',
+        minHold: MIN_HOLD_REQUIREMENT,
+        p2eEnabled: authority !== null
     });
 });
 
