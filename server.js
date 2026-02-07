@@ -34,6 +34,37 @@ const connection = new Connection(RPC_URL, 'confirmed');
 const gameSessions = new Map();
 const playerRecords = new Map();
 
+// Helper function to get token balance (works for both pump.fun and graduated tokens)
+async function getTokenBalance(walletPubkey, mintPubkey) {
+    try {
+        // Get the associated token account address
+        const tokenAccount = await getAssociatedTokenAddress(
+            mintPubkey,
+            walletPubkey,
+            false // allowOwnerOffCurve
+        );
+        
+        // Check if account exists
+        const accountInfo = await connection.getAccountInfo(tokenAccount);
+        
+        if (!accountInfo) {
+            return { balance: 0, exists: false, decimals: 6 };
+        }
+        
+        // Get balance
+        const balanceInfo = await connection.getTokenAccountBalance(tokenAccount);
+        
+        return {
+            balance: balanceInfo.value.uiAmount || 0,
+            exists: true,
+            decimals: balanceInfo.value.decimals
+        };
+    } catch (error) {
+        console.error('Error getting token balance:', error);
+        return { balance: 0, exists: false, decimals: 6 };
+    }
+}
+
 // Health check
 app.get('/health', (req, res) => {
     res.json({
@@ -70,7 +101,7 @@ app.get('/api/debug/connection', async (req, res) => {
     }
 });
 
-// Check player balance
+// Check player balance (works for pump.fun and graduated tokens)
 app.get('/api/check-balance/:wallet', async (req, res) => {
     try {
         // Validate wallet address first
@@ -89,16 +120,11 @@ app.get('/api/check-balance/:wallet', async (req, res) => {
             });
         }
 
-        const tokenAccount = await getAssociatedTokenAddress(
-            CHUM_MINT,
-            playerPubkey
-        );
+        // Get balance using helper function (works for both pump.fun and graduated)
+        const { balance: chumBalance, exists, decimals } = await getTokenBalance(playerPubkey, CHUM_MINT);
         
-        // Check if token account exists first
-        const accountInfo = await connection.getAccountInfo(tokenAccount);
-        
-        if (!accountInfo) {
-            console.log(`⚠️ No $CHUM token account for ${req.params.wallet}`);
+        if (!exists || chumBalance === 0) {
+            console.log(`⚠️ No $CHUM tokens for ${req.params.wallet}`);
             return res.json({
                 wallet: req.params.wallet,
                 balance: 0,
@@ -106,17 +132,14 @@ app.get('/api/check-balance/:wallet', async (req, res) => {
                 eligible: false,
                 deficit: MIN_HOLD_REQUIREMENT,
                 error: 'No $CHUM tokens found',
-                message: 'This wallet has never received $CHUM tokens. Buy $CHUM first!'
+                message: 'This wallet has no $CHUM tokens. Buy $CHUM first!'
             });
         }
-
-        const balance = await connection.getTokenAccountBalance(tokenAccount);
-        const chumBalance = balance.value.uiAmount || 0;
         
         const eligible = chumBalance >= MIN_HOLD_REQUIREMENT;
         const deficit = Math.max(0, MIN_HOLD_REQUIREMENT - chumBalance);
         
-        console.log(`✅ Balance check: ${req.params.wallet.slice(0,4)}...${req.params.wallet.slice(-4)} = ${chumBalance.toLocaleString()} $CHUM (eligible: ${eligible})`);
+        console.log(`✅ Balance: ${req.params.wallet.slice(0,4)}...${req.params.wallet.slice(-4)} = ${chumBalance.toLocaleString()} $CHUM (eligible: ${eligible})`);
         
         res.json({
             wallet: req.params.wallet,
@@ -124,7 +147,7 @@ app.get('/api/check-balance/:wallet', async (req, res) => {
             required: MIN_HOLD_REQUIREMENT,
             eligible,
             deficit,
-            decimals: balance.value.decimals,
+            decimals: decimals,
             message: eligible 
                 ? `✅ Eligible! You hold ${chumBalance.toLocaleString()} $CHUM`
                 : `❌ Need ${deficit.toLocaleString()} more $CHUM (you have ${chumBalance.toLocaleString()})`
@@ -162,28 +185,20 @@ app.post('/api/verify-eligibility', async (req, res) => {
             });
         }
 
-        const tokenAccount = await getAssociatedTokenAddress(
-            CHUM_MINT,
-            playerPubkey
-        );
+        // Get balance using helper function
+        const { balance: chumBalance, exists, decimals } = await getTokenBalance(playerPubkey, CHUM_MINT);
         
-        // Check if token account exists
-        const accountInfo = await connection.getAccountInfo(tokenAccount);
-        
-        if (!accountInfo) {
-            console.log(`⚠️ No token account for ${playerWallet}`);
+        if (!exists || chumBalance === 0) {
+            console.log(`⚠️ No tokens for ${playerWallet}`);
             return res.json({
                 eligible: false,
                 balance: 0,
                 required: MIN_HOLD_REQUIREMENT,
                 deficit: MIN_HOLD_REQUIREMENT,
                 error: 'No $CHUM tokens found',
-                message: 'This wallet has never received $CHUM. Buy $CHUM first!'
+                message: 'This wallet has no $CHUM. Buy $CHUM first!'
             });
         }
-        
-        const balance = await connection.getTokenAccountBalance(tokenAccount);
-        const chumBalance = balance.value.uiAmount || 0;
         
         if (chumBalance < MIN_HOLD_REQUIREMENT) {
             console.log(`❌ Insufficient balance: ${playerWallet} has ${chumBalance} $CHUM`);
@@ -250,23 +265,15 @@ app.post('/api/claim-rewards', async (req, res) => {
         }
 
         // Check player is still eligible
-        const tokenAccount = await getAssociatedTokenAddress(
-            CHUM_MINT,
-            playerPubkey
-        );
+        const { balance: chumBalance, exists } = await getTokenBalance(playerPubkey, CHUM_MINT);
         
-        const accountInfo = await connection.getAccountInfo(tokenAccount);
-        
-        if (!accountInfo) {
+        if (!exists || chumBalance === 0) {
             return res.json({
                 success: false,
                 error: 'NO_TOKEN_ACCOUNT',
                 message: 'No $CHUM token account found'
             });
         }
-        
-        const balance = await connection.getTokenAccountBalance(tokenAccount);
-        const chumBalance = balance.value.uiAmount || 0;
         
         if (chumBalance < MIN_HOLD_REQUIREMENT) {
             return res.json({
@@ -379,3 +386,4 @@ if (process.env.VERCEL !== '1') {
 
 // Export for Vercel serverless
 module.exports = app;
+```
