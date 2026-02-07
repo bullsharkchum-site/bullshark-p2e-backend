@@ -11,10 +11,10 @@ app.use(express.json());
 // Configuration
 const RPC_URL = process.env.RPC_URL || 'https://mainnet.helius-rpc.com/?api-key=64ae06e8-606e-4e6d-8c79-bb210ae08977';
 const CHUM_MINT = new PublicKey(process.env.CHUM_MINT || 'B9nLmgbkW9X59xvwne1Z7qfJ46AsAmNEydMiJrgxpump');
-const MIN_HOLD_REQUIREMENT = parseInt(process.env.MIN_HOLD_REQUIREMENT || '25000'); // 25K $CHUM
+const MIN_HOLD_REQUIREMENT = parseInt(process.env.MIN_HOLD_REQUIREMENT || '25000');
 const POINTS_PER_CHUM = 3000;
 
-// Load authority keypair (optional for now)
+// Load authority keypair
 let authority = null;
 try {
     if (process.env.AUTHORITY_KEYPAIR) {
@@ -25,33 +25,30 @@ try {
         console.log('⚠️ No authority keypair - P2E reward claiming disabled');
     }
 } catch (error) {
-    console.error('⚠️ Failed to load authority keypair - P2E reward claiming disabled');
+    console.error('⚠️ Failed to load authority keypair');
 }
 
 const connection = new Connection(RPC_URL, 'confirmed');
 
-// In-memory storage for game sessions (use database in production)
+// In-memory storage
 const gameSessions = new Map();
 const playerRecords = new Map();
 
-// Helper function to get token balance (works for both pump.fun and graduated tokens)
+// Helper function to get token balance
 async function getTokenBalance(walletPubkey, mintPubkey) {
     try {
-        // Get the associated token account address
         const tokenAccount = await getAssociatedTokenAddress(
             mintPubkey,
             walletPubkey,
-            false // allowOwnerOffCurve
+            false
         );
         
-        // Check if account exists
         const accountInfo = await connection.getAccountInfo(tokenAccount);
         
         if (!accountInfo) {
             return { balance: 0, exists: false, decimals: 6 };
         }
         
-        // Get balance
         const balanceInfo = await connection.getTokenAccountBalance(tokenAccount);
         
         return {
@@ -74,7 +71,7 @@ app.get('/health', (req, res) => {
         chumMint: CHUM_MINT.toString(),
         minHold: MIN_HOLD_REQUIREMENT,
         p2eEnabled: authority !== null,
-        rpcUrl: RPC_URL.split('?')[0] // Hide API key
+        rpcUrl: RPC_URL.split('?')[0]
     });
 });
 
@@ -101,10 +98,9 @@ app.get('/api/debug/connection', async (req, res) => {
     }
 });
 
-// Check player balance (works for pump.fun and graduated tokens)
+// Check player balance
 app.get('/api/check-balance/:wallet', async (req, res) => {
     try {
-        // Validate wallet address first
         let playerPubkey;
         try {
             playerPubkey = new PublicKey(req.params.wallet);
@@ -120,7 +116,6 @@ app.get('/api/check-balance/:wallet', async (req, res) => {
             });
         }
 
-        // Get balance using helper function (works for both pump.fun and graduated)
         const { balance: chumBalance, exists, decimals } = await getTokenBalance(playerPubkey, CHUM_MINT);
         
         if (!exists || chumBalance === 0) {
@@ -174,7 +169,6 @@ app.post('/api/verify-eligibility', async (req, res) => {
             return res.status(400).json({ error: 'Player wallet required' });
         }
 
-        // Validate wallet address
         let playerPubkey;
         try {
             playerPubkey = new PublicKey(playerWallet);
@@ -185,7 +179,6 @@ app.post('/api/verify-eligibility', async (req, res) => {
             });
         }
 
-        // Get balance using helper function
         const { balance: chumBalance, exists, decimals } = await getTokenBalance(playerPubkey, CHUM_MINT);
         
         if (!exists || chumBalance === 0) {
@@ -211,7 +204,6 @@ app.post('/api/verify-eligibility', async (req, res) => {
             });
         }
 
-        // Store player record
         playerRecords.set(playerWallet, {
             wallet: playerWallet,
             balance: chumBalance,
@@ -253,7 +245,6 @@ app.post('/api/claim-rewards', async (req, res) => {
             });
         }
 
-        // Validate wallet
         let playerPubkey;
         try {
             playerPubkey = new PublicKey(playerWallet);
@@ -264,7 +255,6 @@ app.post('/api/claim-rewards', async (req, res) => {
             });
         }
 
-        // Check player is still eligible
         const { balance: chumBalance, exists } = await getTokenBalance(playerPubkey, CHUM_MINT);
         
         if (!exists || chumBalance === 0) {
@@ -285,11 +275,9 @@ app.post('/api/claim-rewards', async (req, res) => {
             });
         }
 
-        // Calculate rewards
         const chumEarned = points / POINTS_PER_CHUM;
         const sessionId = Date.now();
 
-        // Store session
         gameSessions.set(sessionId, {
             player: playerWallet,
             points,
@@ -298,7 +286,6 @@ app.post('/api/claim-rewards', async (req, res) => {
             claimed: true
         });
 
-        // Update player record
         const playerRecord = playerRecords.get(playerWallet) || {
             wallet: playerWallet,
             totalEarned: 0,
@@ -311,13 +298,10 @@ app.post('/api/claim-rewards', async (req, res) => {
         playerRecords.set(playerWallet, playerRecord);
 
         console.log(`🎮 ${playerWallet.slice(0,4)}...${playerWallet.slice(-4)} earned ${chumEarned.toFixed(4)} $CHUM from ${points.toLocaleString()} points`);
-
-        // TODO: Actually transfer tokens from PDA
-        // For now, just return success
         
         res.json({
             success: true,
-            signature: 'SIMULATED_TX_' + sessionId, // Replace with actual tx signature
+            signature: 'SIMULATED_TX_' + sessionId,
             points,
             chumEarned: chumEarned.toFixed(4),
             sessionId,
@@ -367,13 +351,12 @@ app.get('/api/admin/sessions', (req, res) => {
         totalSessions: gameSessions.size,
         totalPlayers: playerRecords.size,
         totalChumEarned: totalChumEarned.toFixed(4),
-        sessions: Array.from(gameSessions.values()).slice(-50) // Last 50 sessions
+        sessions: Array.from(gameSessions.values()).slice(-50)
     });
 });
 
 const PORT = process.env.PORT || 3000;
 
-// Only start server if not in Vercel serverless environment
 if (process.env.VERCEL !== '1') {
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`🦈 BullShark P2E API running on port ${PORT}`);
@@ -384,6 +367,4 @@ if (process.env.VERCEL !== '1') {
     });
 }
 
-// Export for Vercel serverless
 module.exports = app;
-```
