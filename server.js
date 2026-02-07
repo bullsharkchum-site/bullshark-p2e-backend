@@ -2,7 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Connection, Keypair, PublicKey } = require('@solana/web3.js');
-const { getAssociatedTokenAddress } = require('@solana/spl-token');
+const { getAssociatedTokenAddress, getMint } = require('@solana/spl-token');
+const bs58 = require('bs58');
 
 const app = express();
 app.use(cors());
@@ -10,19 +11,16 @@ app.use(express.json());
 
 // Configuration
 const RPC_URL = process.env.RPC_URL || 'https://mainnet.helius-rpc.com/?api-key=64ae06e8-606e-4e6d-8c79-bb210ae08977';
-const CHUM_MINT = new PublicKey(process.env.CHUM_MINT || 'B9nLmgbkW9X59xvwne1Z7qfJ46AsAmNEydMiJrgxpump');
+const CHUM_MINT = process.env.CHUM_MINT || 'B9nLmgbkW9X59xvwne1Z7qfJ46AsAmNEydMiJrgxpump';
 const MIN_HOLD_REQUIREMENT = parseInt(process.env.MIN_HOLD_REQUIREMENT || '25000');
 const POINTS_PER_CHUM = 3000;
 
-// Load authority keypair
 let authority = null;
 try {
     if (process.env.AUTHORITY_KEYPAIR) {
         const keypairData = JSON.parse(process.env.AUTHORITY_KEYPAIR);
         authority = Keypair.fromSecretKey(new Uint8Array(keypairData));
         console.log('✅ Authority loaded:', authority.publicKey.toString());
-    } else {
-        console.log('⚠️ No authority keypair - P2E reward claiming disabled');
     }
 } catch (error) {
     console.error('⚠️ Failed to load authority keypair');
@@ -34,32 +32,193 @@ const connection = new Connection(RPC_URL, 'confirmed');
 const gameSessions = new Map();
 const playerRecords = new Map();
 
-// Helper function to get token balance
-async function getTokenBalance(walletPubkey, mintPubkey) {
-    try {
-        const tokenAccount = await getAssociatedTokenAddress(
-            mintPubkey,
-            walletPubkey,
-            false
-        );
+// ✅ COPIED FROM BOT: Token Program IDs
+const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+
+// ✅ COPIED FROM BOT: Solana address validator
+function isValidSolanaAddress(address) {
+  try {
+    if (!address || typeof address !== "string") return false;
+    address = address.trim();
+    
+    const decoded = bs58.decode(address);
+    if (decoded.length !== 32) return false;
+    
+    if (address.length < 30 || address.length > 48) return false;
+    
+    new PublicKey(address);
+    
+    return true;
+  } catch (error) {
+    console.log(`⚠️ Invalid address: ${address?.substring(0, 10)}...`);
+    return false;
+  }
+}
+
+// ✅ COPIED FROM BOT: Get token balance with BOTH token programs
+async function getTokenBalance(ownerAddress, mintAddress) {
+  try {
+    if (!mintAddress || mintAddress === 'SOL') return 0;
+    const owner = new PublicKey(ownerAddress);
+    const mint = new PublicKey(mintAddress);
+    let total = 0;
+
+    // ✅ Check BOTH token programs (standard + Token-2022)
+    for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+      const resp = await connection.getParsedTokenAccountsByOwner(owner, { programId });
+      for (const a of resp.value) {
+        const info = a.account?.data?.parsed?.info;
+        if (!info || info.mint !== mint.toBase58()) continue;
+        const amt = info.tokenAmount || {};
+        const asNumber = amt.uiAmountString ? Number(amt.uiAmountString) : Number(amt.uiAmount ?? 0);
+        if (Number.isFinite(asNumber)) total += asNumber;
+      }
+    }
+    return total;
+  } catch (e) {
+    console.error('getTokenBalance error:', e.message);
+    return 0;
+  }
+}
+
+// ✅ COPIED FROM BOT: Pump.fun detection
+async function checkPumpfunToken(mint) {
+  try {
+    console.log(`🔍 Checking Pump.fun API for: ${mint.slice(0,8)}...`);
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    
+    const response = await fetch(`https://frontend-api.pump.fun/coins/${mint}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': 'application/json'
+      },
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    console.log(`📡 Pump.fun API response: ${response.status}`);
+    
+    if (response.status >= 500) {
+      console.log(`⚠️ Pump.fun API temporarily unavailable (${response.status})`);
+      return { isPumpfun: null, graduated: null }; // Unknown due to API error
+    }
+    
+    if (response.ok) {
+      const data = await response.json();
+      
+      if (data?.mint) {
+        const isGraduated = !!data.raydium_pool;
+        const marketCap = Number(data.usd_market_cap || 0);
         
-        const accountInfo = await connection.getAccountInfo(tokenAccount);
-        
-        if (!accountInfo) {
-            return { balance: 0, exists: false, decimals: 6 };
-        }
-        
-        const balanceInfo = await connection.getTokenAccountBalance(tokenAccount);
+        console.log(`✅ Pump.fun token detected: ${isGraduated ? 'GRADUATED' : 'PRE-GRADUATION'}`);
+        console.log(`   Market Cap: $${marketCap.toLocaleString()}`);
         
         return {
-            balance: balanceInfo.value.uiAmount || 0,
-            exists: true,
-            decimals: balanceInfo.value.decimals
+          isPumpfun: true,
+          graduated: isGraduated,
+          marketCap: marketCap,
+          bondingCurve: data.bonding_curve,
+          raydiumPool: data.raydium_pool
         };
-    } catch (error) {
-        console.error('Error getting token balance:', error);
-        return { balance: 0, exists: false, decimals: 6 };
+      }
+    } else if (response.status === 404) {
+      console.log(`ℹ️ Token not found on pump.fun (404)`);
+      return { isPumpfun: false, graduated: null };
     }
+    
+    return { isPumpfun: null, graduated: null };
+  } catch (pumpErr) {
+    if (pumpErr.name === 'AbortError') {
+      console.log(`⚠️ Pump.fun API timeout`);
+    } else {
+      console.log(`⚠️ Pump.fun check failed: ${pumpErr.message}`);
+    }
+    return { isPumpfun: null, graduated: null };
+  }
+}
+
+// ✅ ENHANCED: Token balance checker that works for ALL token types
+async function getComprehensiveTokenBalance(walletAddress, tokenMint) {
+  try {
+    console.log(`🔍 Comprehensive balance check for ${walletAddress.slice(0,8)}...`);
+    
+    if (!isValidSolanaAddress(walletAddress) || !isValidSolanaAddress(tokenMint)) {
+      console.log('❌ Invalid address format');
+      return 0;
+    }
+    
+    const owner = new PublicKey(walletAddress);
+    const mint = new PublicKey(tokenMint);
+    
+    // ✅ STEP 1: Check if it's a pump.fun token
+    const pumpInfo = await checkPumpfunToken(tokenMint);
+    
+    if (pumpInfo.isPumpfun === true && !pumpInfo.graduated) {
+      // ✅ PRE-GRADUATION PUMP.FUN TOKEN
+      console.log(`🎯 Pre-graduation pump.fun token - checking bonding curve holdings`);
+      
+      // For pre-graduation tokens, we need to check Pump.fun's bonding curve
+      // The balance is held in the bonding curve contract, not a standard ATA
+      // We can still try to get an ATA balance in case they have any
+      const balance = await getTokenBalance(walletAddress, tokenMint);
+      
+      if (balance > 0) {
+        console.log(`✅ Found ${balance} tokens (may be from bonding curve or graduated)`);
+        return balance;
+      }
+      
+      console.log(`ℹ️ No standard ATA balance found for pre-graduation token`);
+      // For pre-graduation tokens with no ATA, we can't reliably check balance
+      // without querying Pump.fun's bonding curve directly
+      return 0;
+    }
+    
+    // ✅ STEP 2: Standard token or graduated pump.fun token
+    console.log(`🔍 Checking standard token programs...`);
+    const balance = await getTokenBalance(walletAddress, tokenMint);
+    
+    if (balance > 0) {
+      console.log(`✅ Found ${balance} tokens via standard method`);
+      return balance;
+    }
+    
+    // ✅ STEP 3: Last resort - check raw token accounts
+    console.log(`🔍 Checking raw token accounts as fallback...`);
+    const tokenAccounts = await connection.getTokenAccountsByOwner(
+      owner,
+      { mint: mint }
+    );
+    
+    if (tokenAccounts.value.length > 0) {
+      // Parse raw account data
+      let totalBalance = 0;
+      for (const account of tokenAccounts.value) {
+        try {
+          const accountInfo = await connection.getParsedAccountInfo(account.pubkey);
+          const balance = accountInfo.value?.data?.parsed?.info?.tokenAmount?.uiAmount || 0;
+          totalBalance += balance;
+        } catch (e) {
+          console.log(`⚠️ Failed to parse token account: ${e.message}`);
+        }
+      }
+      
+      if (totalBalance > 0) {
+        console.log(`✅ Found ${totalBalance} tokens via raw account check`);
+        return totalBalance;
+      }
+    }
+    
+    console.log(`ℹ️ No token balance found after all checks`);
+    return 0;
+    
+  } catch (error) {
+    console.error('❌ getComprehensiveTokenBalance error:', error.message);
+    return 0;
+  }
 }
 
 // Health check
@@ -67,100 +226,61 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        authority: authority ? authority.publicKey.toString() : 'Not configured',
-        chumMint: CHUM_MINT.toString(),
+        chumMint: CHUM_MINT,
         minHold: MIN_HOLD_REQUIREMENT,
-        p2eEnabled: authority !== null,
         rpcUrl: RPC_URL.split('?')[0]
     });
 });
 
-// Debug endpoint
-app.get('/api/debug/connection', async (req, res) => {
-    try {
-        const slot = await connection.getSlot();
-        const blockTime = await connection.getBlockTime(slot);
-        
-        res.json({
-            status: 'connected',
-            rpcUrl: RPC_URL.split('?')[0],
-            currentSlot: slot,
-            blockTime: new Date(blockTime * 1000).toISOString(),
-            chumMint: CHUM_MINT.toString(),
-            minHold: MIN_HOLD_REQUIREMENT
-        });
-    } catch (error) {
-        res.status(500).json({
-            status: 'error',
-            error: error.message,
-            rpcUrl: RPC_URL.split('?')[0]
-        });
-    }
-});
-
-// Check player balance
+// ✅ ENHANCED: Check balance endpoint
 app.get('/api/check-balance/:wallet', async (req, res) => {
     try {
-        let playerPubkey;
-        try {
-            playerPubkey = new PublicKey(req.params.wallet);
-        } catch (e) {
-            console.log(`❌ Invalid wallet address: ${req.params.wallet}`);
-            return res.json({
-                wallet: req.params.wallet,
-                balance: 0,
-                required: MIN_HOLD_REQUIREMENT,
-                eligible: false,
-                deficit: MIN_HOLD_REQUIREMENT,
-                error: 'Invalid wallet address'
-            });
-        }
-
-        const { balance: chumBalance, exists, decimals } = await getTokenBalance(playerPubkey, CHUM_MINT);
+        const walletAddress = req.params.wallet;
         
-        if (!exists || chumBalance === 0) {
-            console.log(`⚠️ No $CHUM tokens for ${req.params.wallet}`);
+        console.log(`\n🔍 Balance check request for: ${walletAddress}`);
+        
+        if (!isValidSolanaAddress(walletAddress)) {
+            console.log(`❌ Invalid wallet address format`);
             return res.json({
-                wallet: req.params.wallet,
+                wallet: walletAddress,
                 balance: 0,
                 required: MIN_HOLD_REQUIREMENT,
                 eligible: false,
-                deficit: MIN_HOLD_REQUIREMENT,
-                error: 'No $CHUM tokens found',
-                message: 'This wallet has no $CHUM tokens. Buy $CHUM first!'
+                error: 'Invalid wallet address format'
             });
         }
+        
+        // ✅ Use comprehensive balance checker
+        const chumBalance = await getComprehensiveTokenBalance(walletAddress, CHUM_MINT);
         
         const eligible = chumBalance >= MIN_HOLD_REQUIREMENT;
         const deficit = Math.max(0, MIN_HOLD_REQUIREMENT - chumBalance);
         
-        console.log(`✅ Balance: ${req.params.wallet.slice(0,4)}...${req.params.wallet.slice(-4)} = ${chumBalance.toLocaleString()} $CHUM (eligible: ${eligible})`);
+        console.log(`✅ Balance check result: ${chumBalance.toLocaleString()} $CHUM (eligible: ${eligible})`);
         
         res.json({
-            wallet: req.params.wallet,
+            wallet: walletAddress,
             balance: chumBalance,
             required: MIN_HOLD_REQUIREMENT,
             eligible,
             deficit,
-            decimals: decimals,
             message: eligible 
                 ? `✅ Eligible! You hold ${chumBalance.toLocaleString()} $CHUM`
                 : `❌ Need ${deficit.toLocaleString()} more $CHUM (you have ${chumBalance.toLocaleString()})`
         });
     } catch (error) {
-        console.error('❌ Balance check error:', error);
+        console.error(`❌ Balance check error:`, error);
         res.status(500).json({
             wallet: req.params.wallet,
             balance: 0,
             required: MIN_HOLD_REQUIREMENT,
             eligible: false,
-            deficit: MIN_HOLD_REQUIREMENT,
-            error: `Failed to check balance: ${error.message}`
+            error: error.message
         });
     }
 });
 
-// Verify eligibility
+// ✅ ENHANCED: Verify eligibility endpoint
 app.post('/api/verify-eligibility', async (req, res) => {
     try {
         const { playerWallet } = req.body;
@@ -168,42 +288,40 @@ app.post('/api/verify-eligibility', async (req, res) => {
         if (!playerWallet) {
             return res.status(400).json({ error: 'Player wallet required' });
         }
-
-        let playerPubkey;
-        try {
-            playerPubkey = new PublicKey(playerWallet);
-        } catch (e) {
+        
+        console.log(`\n🔍 Eligibility check for: ${playerWallet}`);
+        
+        if (!isValidSolanaAddress(playerWallet)) {
             return res.status(400).json({
                 eligible: false,
-                error: 'Invalid wallet address'
+                error: 'Invalid wallet address format'
             });
         }
-
-        const { balance: chumBalance, exists, decimals } = await getTokenBalance(playerPubkey, CHUM_MINT);
         
-        if (!exists || chumBalance === 0) {
-            console.log(`⚠️ No tokens for ${playerWallet}`);
+        const chumBalance = await getComprehensiveTokenBalance(playerWallet, CHUM_MINT);
+        
+        if (chumBalance === 0) {
+            console.log(`⚠️ No tokens found for ${playerWallet}`);
             return res.json({
                 eligible: false,
                 balance: 0,
                 required: MIN_HOLD_REQUIREMENT,
                 deficit: MIN_HOLD_REQUIREMENT,
-                error: 'No $CHUM tokens found',
-                message: 'This wallet has no $CHUM. Buy $CHUM first!'
+                message: 'No $CHUM tokens found. Buy $CHUM first!'
             });
         }
         
         if (chumBalance < MIN_HOLD_REQUIREMENT) {
-            console.log(`❌ Insufficient balance: ${playerWallet} has ${chumBalance} $CHUM`);
+            console.log(`❌ Insufficient balance: ${chumBalance} $CHUM`);
             return res.json({
                 eligible: false,
                 balance: chumBalance,
                 required: MIN_HOLD_REQUIREMENT,
                 deficit: MIN_HOLD_REQUIREMENT - chumBalance,
-                message: `Need ${(MIN_HOLD_REQUIREMENT - chumBalance).toLocaleString()} more $CHUM (you have ${chumBalance.toLocaleString()})`
+                message: `Need ${(MIN_HOLD_REQUIREMENT - chumBalance).toLocaleString()} more $CHUM`
             });
         }
-
+        
         playerRecords.set(playerWallet, {
             wallet: playerWallet,
             balance: chumBalance,
@@ -211,17 +329,17 @@ app.post('/api/verify-eligibility', async (req, res) => {
             totalEarned: 0,
             totalClaimed: 0
         });
-
-        console.log(`✅ Player verified: ${playerWallet.slice(0,4)}...${playerWallet.slice(-4)} with ${chumBalance.toLocaleString()} $CHUM`);
+        
+        console.log(`✅ Player verified with ${chumBalance.toLocaleString()} $CHUM`);
         
         res.json({
             eligible: true,
             balance: chumBalance,
             required: MIN_HOLD_REQUIREMENT,
-            message: `✅ Verified! You hold ${chumBalance.toLocaleString()} $CHUM and can earn rewards!`
+            message: `✅ Verified! You hold ${chumBalance.toLocaleString()} $CHUM`
         });
     } catch (error) {
-        console.error('❌ Verification error:', error);
+        console.error(`❌ Verification error:`, error);
         res.status(500).json({ 
             eligible: false,
             error: error.message 
@@ -229,7 +347,7 @@ app.post('/api/verify-eligibility', async (req, res) => {
     }
 });
 
-// Claim rewards
+// Claim rewards endpoint (keeping your existing logic)
 app.post('/api/claim-rewards', async (req, res) => {
     try {
         const { playerWallet, points } = req.body;
@@ -245,19 +363,9 @@ app.post('/api/claim-rewards', async (req, res) => {
             });
         }
 
-        let playerPubkey;
-        try {
-            playerPubkey = new PublicKey(playerWallet);
-        } catch (e) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid wallet address'
-            });
-        }
-
-        const { balance: chumBalance, exists } = await getTokenBalance(playerPubkey, CHUM_MINT);
+        const chumBalance = await getComprehensiveTokenBalance(playerWallet, CHUM_MINT);
         
-        if (!exists || chumBalance === 0) {
+        if (chumBalance === 0) {
             return res.json({
                 success: false,
                 error: 'NO_TOKEN_ACCOUNT',
@@ -271,7 +379,7 @@ app.post('/api/claim-rewards', async (req, res) => {
                 error: 'INSUFFICIENT_BALANCE',
                 balance: chumBalance,
                 required: MIN_HOLD_REQUIREMENT,
-                message: `You need at least ${MIN_HOLD_REQUIREMENT.toLocaleString()} $CHUM to earn rewards`
+                message: `Need at least ${MIN_HOLD_REQUIREMENT.toLocaleString()} $CHUM`
             });
         }
 
@@ -297,7 +405,7 @@ app.post('/api/claim-rewards', async (req, res) => {
         playerRecord.lastClaim = Date.now();
         playerRecords.set(playerWallet, playerRecord);
 
-        console.log(`🎮 ${playerWallet.slice(0,4)}...${playerWallet.slice(-4)} earned ${chumEarned.toFixed(4)} $CHUM from ${points.toLocaleString()} points`);
+        console.log(`🎮 ${playerWallet.slice(0,4)}... earned ${chumEarned.toFixed(4)} $CHUM`);
         
         res.json({
             success: true,
@@ -309,7 +417,7 @@ app.post('/api/claim-rewards', async (req, res) => {
             message: `🦈 You earned ${chumEarned.toFixed(4)} $CHUM!`
         });
     } catch (error) {
-        console.error('❌ Claim error:', error);
+        console.error(`❌ Claim error:`, error);
         res.status(500).json({ 
             success: false,
             error: error.message 
@@ -324,8 +432,7 @@ app.get('/api/player/:wallet', async (req, res) => {
         
         if (!record) {
             return res.status(404).json({ 
-                error: 'Player not found',
-                message: 'Player has not verified yet'
+                error: 'Player not found'
             });
         }
 
@@ -336,32 +443,13 @@ app.get('/api/player/:wallet', async (req, res) => {
     }
 });
 
-// Get all sessions (admin)
-app.get('/api/admin/sessions', (req, res) => {
-    const { adminKey } = req.query;
-    
-    if (adminKey !== process.env.ADMIN_KEY) {
-        return res.status(403).json({ error: 'Unauthorized' });
-    }
-
-    const totalChumEarned = Array.from(gameSessions.values())
-        .reduce((sum, session) => sum + session.chumEarned, 0);
-
-    res.json({
-        totalSessions: gameSessions.size,
-        totalPlayers: playerRecords.size,
-        totalChumEarned: totalChumEarned.toFixed(4),
-        sessions: Array.from(gameSessions.values()).slice(-50)
-    });
-});
-
 const PORT = process.env.PORT || 3000;
 
 if (process.env.VERCEL !== '1') {
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`🦈 BullShark P2E API running on port ${PORT}`);
         console.log(`📡 RPC: ${RPC_URL.split('?')[0]}`);
-        console.log(`💎 $CHUM Mint: ${CHUM_MINT.toString()}`);
+        console.log(`💎 $CHUM Mint: ${CHUM_MINT}`);
         console.log(`🎮 Min Hold: ${MIN_HOLD_REQUIREMENT.toLocaleString()} $CHUM`);
         console.log(`🎯 Conversion: ${POINTS_PER_CHUM.toLocaleString()} points = 1 $CHUM`);
     });
