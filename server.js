@@ -28,9 +28,9 @@ try {
 
 const connection = new Connection(RPC_URL, 'confirmed');
 
-// In-memory storage
-const gameSessions = new Map();
-const playerRecords = new Map();
+// ✅ ENHANCED: In-memory storage with detailed tracking
+const gameSessions = new Map(); // All game sessions
+const playerRecords = new Map(); // Player accumulated rewards
 
 // ✅ COPIED FROM BOT: Token Program IDs
 const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
@@ -64,7 +64,6 @@ async function getTokenBalance(ownerAddress, mintAddress) {
     const mint = new PublicKey(mintAddress);
     let total = 0;
 
-    // ✅ Check BOTH token programs (standard + Token-2022)
     for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
       const resp = await connection.getParsedTokenAccountsByOwner(owner, { programId });
       for (const a of resp.value) {
@@ -104,7 +103,7 @@ async function checkPumpfunToken(mint) {
     
     if (response.status >= 500) {
       console.log(`⚠️ Pump.fun API temporarily unavailable (${response.status})`);
-      return { isPumpfun: null, graduated: null }; // Unknown due to API error
+      return { isPumpfun: null, graduated: null };
     }
     
     if (response.ok) {
@@ -154,16 +153,11 @@ async function getComprehensiveTokenBalance(walletAddress, tokenMint) {
     const owner = new PublicKey(walletAddress);
     const mint = new PublicKey(tokenMint);
     
-    // ✅ STEP 1: Check if it's a pump.fun token
     const pumpInfo = await checkPumpfunToken(tokenMint);
     
     if (pumpInfo.isPumpfun === true && !pumpInfo.graduated) {
-      // ✅ PRE-GRADUATION PUMP.FUN TOKEN
       console.log(`🎯 Pre-graduation pump.fun token - checking bonding curve holdings`);
       
-      // For pre-graduation tokens, we need to check Pump.fun's bonding curve
-      // The balance is held in the bonding curve contract, not a standard ATA
-      // We can still try to get an ATA balance in case they have any
       const balance = await getTokenBalance(walletAddress, tokenMint);
       
       if (balance > 0) {
@@ -172,12 +166,9 @@ async function getComprehensiveTokenBalance(walletAddress, tokenMint) {
       }
       
       console.log(`ℹ️ No standard ATA balance found for pre-graduation token`);
-      // For pre-graduation tokens with no ATA, we can't reliably check balance
-      // without querying Pump.fun's bonding curve directly
       return 0;
     }
     
-    // ✅ STEP 2: Standard token or graduated pump.fun token
     console.log(`🔍 Checking standard token programs...`);
     const balance = await getTokenBalance(walletAddress, tokenMint);
     
@@ -186,7 +177,6 @@ async function getComprehensiveTokenBalance(walletAddress, tokenMint) {
       return balance;
     }
     
-    // ✅ STEP 3: Last resort - check raw token accounts
     console.log(`🔍 Checking raw token accounts as fallback...`);
     const tokenAccounts = await connection.getTokenAccountsByOwner(
       owner,
@@ -194,7 +184,6 @@ async function getComprehensiveTokenBalance(walletAddress, tokenMint) {
     );
     
     if (tokenAccounts.value.length > 0) {
-      // Parse raw account data
       let totalBalance = 0;
       for (const account of tokenAccounts.value) {
         try {
@@ -221,6 +210,25 @@ async function getComprehensiveTokenBalance(walletAddress, tokenMint) {
   }
 }
 
+// ✅ NEW: Initialize or get player record
+function getOrCreatePlayerRecord(wallet) {
+  if (!playerRecords.has(wallet)) {
+    playerRecords.set(wallet, {
+      wallet,
+      totalEarned: 0,
+      totalClaimed: 0,
+      pendingRewards: 0,
+      balance: 0,
+      gamesPlayed: 0,
+      lastGameAt: null,
+      lastClaimAt: null,
+      verifiedAt: null,
+      earnHistory: []
+    });
+  }
+  return playerRecords.get(wallet);
+}
+
 // Health check
 app.get('/health', (req, res) => {
     res.json({
@@ -228,7 +236,9 @@ app.get('/health', (req, res) => {
         timestamp: new Date().toISOString(),
         chumMint: CHUM_MINT,
         minHold: MIN_HOLD_REQUIREMENT,
-        rpcUrl: RPC_URL.split('?')[0]
+        rpcUrl: RPC_URL.split('?')[0],
+        playersTracked: playerRecords.size,
+        totalSessions: gameSessions.size
     });
 });
 
@@ -250,11 +260,13 @@ app.get('/api/check-balance/:wallet', async (req, res) => {
             });
         }
         
-        // ✅ Use comprehensive balance checker
         const chumBalance = await getComprehensiveTokenBalance(walletAddress, CHUM_MINT);
         
         const eligible = chumBalance >= MIN_HOLD_REQUIREMENT;
         const deficit = Math.max(0, MIN_HOLD_REQUIREMENT - chumBalance);
+        
+        // ✅ Get player rewards if they exist
+        const playerRecord = playerRecords.get(walletAddress);
         
         console.log(`✅ Balance check result: ${chumBalance.toLocaleString()} $CHUM (eligible: ${eligible})`);
         
@@ -264,6 +276,10 @@ app.get('/api/check-balance/:wallet', async (req, res) => {
             required: MIN_HOLD_REQUIREMENT,
             eligible,
             deficit,
+            // ✅ Include pending rewards info
+            pendingRewards: playerRecord?.pendingRewards || 0,
+            totalEarned: playerRecord?.totalEarned || 0,
+            totalClaimed: playerRecord?.totalClaimed || 0,
             message: eligible 
                 ? `✅ Eligible! You hold ${chumBalance.toLocaleString()} $CHUM`
                 : `❌ Need ${deficit.toLocaleString()} more $CHUM (you have ${chumBalance.toLocaleString()})`
@@ -322,13 +338,10 @@ app.post('/api/verify-eligibility', async (req, res) => {
             });
         }
         
-        playerRecords.set(playerWallet, {
-            wallet: playerWallet,
-            balance: chumBalance,
-            verifiedAt: Date.now(),
-            totalEarned: 0,
-            totalClaimed: 0
-        });
+        // ✅ Get or create player record
+        const playerRecord = getOrCreatePlayerRecord(playerWallet);
+        playerRecord.balance = chumBalance;
+        playerRecord.verifiedAt = Date.now();
         
         console.log(`✅ Player verified with ${chumBalance.toLocaleString()} $CHUM`);
         
@@ -336,6 +349,9 @@ app.post('/api/verify-eligibility', async (req, res) => {
             eligible: true,
             balance: chumBalance,
             required: MIN_HOLD_REQUIREMENT,
+            pendingRewards: playerRecord.pendingRewards,
+            totalEarned: playerRecord.totalEarned,
+            totalClaimed: playerRecord.totalClaimed,
             message: `✅ Verified! You hold ${chumBalance.toLocaleString()} $CHUM`
         });
     } catch (error) {
@@ -347,31 +363,25 @@ app.post('/api/verify-eligibility', async (req, res) => {
     }
 });
 
-// Claim rewards endpoint (keeping your existing logic)
-app.post('/api/claim-rewards', async (req, res) => {
+// ✅ NEW: Record game rewards (doesn't claim, just tracks)
+app.post('/api/record-game', async (req, res) => {
     try {
-        const { playerWallet, points } = req.body;
+        const { playerWallet, points, finalScore } = req.body;
 
         if (!playerWallet || !points) {
             return res.status(400).json({ error: 'Missing required fields' });
         }
 
         if (points < POINTS_PER_CHUM) {
-            return res.status(400).json({
-                error: 'Insufficient points',
-                message: `Need at least ${POINTS_PER_CHUM.toLocaleString()} points to earn 1 $CHUM`
+            return res.json({
+                success: false,
+                message: `Need at least ${POINTS_PER_CHUM.toLocaleString()} points to earn $CHUM`,
+                pointsEarned: 0
             });
         }
 
+        // ✅ Verify they still hold enough $CHUM
         const chumBalance = await getComprehensiveTokenBalance(playerWallet, CHUM_MINT);
-        
-        if (chumBalance === 0) {
-            return res.json({
-                success: false,
-                error: 'NO_TOKEN_ACCOUNT',
-                message: 'No $CHUM token account found'
-            });
-        }
         
         if (chumBalance < MIN_HOLD_REQUIREMENT) {
             return res.json({
@@ -379,42 +389,136 @@ app.post('/api/claim-rewards', async (req, res) => {
                 error: 'INSUFFICIENT_BALANCE',
                 balance: chumBalance,
                 required: MIN_HOLD_REQUIREMENT,
-                message: `Need at least ${MIN_HOLD_REQUIREMENT.toLocaleString()} $CHUM`
+                message: `Need at least ${MIN_HOLD_REQUIREMENT.toLocaleString()} $CHUM to earn rewards`
             });
         }
 
         const chumEarned = points / POINTS_PER_CHUM;
-        const sessionId = Date.now();
+        const sessionId = `game_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
+        // ✅ Record game session
         gameSessions.set(sessionId, {
+            sessionId,
             player: playerWallet,
             points,
+            finalScore: finalScore || points,
             chumEarned,
-            timestamp: sessionId,
-            claimed: true
+            timestamp: Date.now(),
+            claimed: false
         });
 
-        const playerRecord = playerRecords.get(playerWallet) || {
-            wallet: playerWallet,
-            totalEarned: 0,
-            totalClaimed: 0
-        };
-        
+        // ✅ Update player record - ADD to pending, NOT claimed
+        const playerRecord = getOrCreatePlayerRecord(playerWallet);
         playerRecord.totalEarned += chumEarned;
-        playerRecord.totalClaimed += chumEarned;
-        playerRecord.lastClaim = Date.now();
-        playerRecords.set(playerWallet, playerRecord);
+        playerRecord.pendingRewards += chumEarned;
+        playerRecord.gamesPlayed += 1;
+        playerRecord.lastGameAt = Date.now();
+        playerRecord.balance = chumBalance;
+        
+        // ✅ Add to earn history
+        playerRecord.earnHistory.push({
+            sessionId,
+            points,
+            chumEarned,
+            timestamp: Date.now(),
+            claimed: false
+        });
 
-        console.log(`🎮 ${playerWallet.slice(0,4)}... earned ${chumEarned.toFixed(4)} $CHUM`);
+        console.log(`🎮 ${playerWallet.slice(0,4)}... earned ${chumEarned.toFixed(4)} $CHUM (pending)`);
+        console.log(`   Total pending: ${playerRecord.pendingRewards.toFixed(4)} $CHUM`);
         
         res.json({
             success: true,
-            signature: 'SIMULATED_TX_' + sessionId,
-            points,
-            chumEarned: chumEarned.toFixed(4),
             sessionId,
+            points,
+            chumEarned: parseFloat(chumEarned.toFixed(4)),
+            pendingRewards: parseFloat(playerRecord.pendingRewards.toFixed(4)),
+            totalEarned: parseFloat(playerRecord.totalEarned.toFixed(4)),
+            totalClaimed: parseFloat(playerRecord.totalClaimed.toFixed(4)),
+            gamesPlayed: playerRecord.gamesPlayed,
+            message: `🦈 You earned ${chumEarned.toFixed(4)} $CHUM! Total pending: ${playerRecord.pendingRewards.toFixed(4)}`
+        });
+    } catch (error) {
+        console.error(`❌ Record game error:`, error);
+        res.status(500).json({ 
+            success: false,
+            error: error.message 
+        });
+    }
+});
+
+// ✅ NEW: Claim accumulated rewards
+app.post('/api/claim-rewards', async (req, res) => {
+    try {
+        const { playerWallet } = req.body;
+
+        if (!playerWallet) {
+            return res.status(400).json({ error: 'Player wallet required' });
+        }
+
+        const playerRecord = playerRecords.get(playerWallet);
+        
+        if (!playerRecord) {
+            return res.status(404).json({
+                success: false,
+                error: 'NO_PLAYER_RECORD',
+                message: 'No rewards to claim. Play some games first!'
+            });
+        }
+
+        if (playerRecord.pendingRewards <= 0) {
+            return res.json({
+                success: false,
+                message: 'No pending rewards to claim',
+                pendingRewards: 0,
+                totalClaimed: playerRecord.totalClaimed
+            });
+        }
+
+        // ✅ Verify they still hold enough $CHUM
+        const chumBalance = await getComprehensiveTokenBalance(playerWallet, CHUM_MINT);
+        
+        if (chumBalance < MIN_HOLD_REQUIREMENT) {
+            return res.json({
+                success: false,
+                error: 'INSUFFICIENT_BALANCE',
+                balance: chumBalance,
+                required: MIN_HOLD_REQUIREMENT,
+                message: `Need at least ${MIN_HOLD_REQUIREMENT.toLocaleString()} $CHUM to claim rewards`
+            });
+        }
+
+        // ✅ Process claim
+        const claimAmount = playerRecord.pendingRewards;
+        const claimId = `claim_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+        playerRecord.totalClaimed += claimAmount;
+        playerRecord.pendingRewards = 0;
+        playerRecord.lastClaimAt = Date.now();
+        
+        // ✅ Mark all pending games as claimed
+        playerRecord.earnHistory.forEach(entry => {
+            if (!entry.claimed) {
+                entry.claimed = true;
+                entry.claimedAt = Date.now();
+                entry.claimId = claimId;
+            }
+        });
+
+        console.log(`💰 ${playerWallet.slice(0,4)}... claimed ${claimAmount.toFixed(4)} $CHUM`);
+        console.log(`   Total claimed: ${playerRecord.totalClaimed.toFixed(4)} $CHUM`);
+        
+        res.json({
+            success: true,
+            claimId,
+            claimAmount: parseFloat(claimAmount.toFixed(4)),
+            totalClaimed: parseFloat(playerRecord.totalClaimed.toFixed(4)),
+            totalEarned: parseFloat(playerRecord.totalEarned.toFixed(4)),
+            pendingRewards: 0,
             timestamp: Date.now(),
-            message: `🦈 You earned ${chumEarned.toFixed(4)} $CHUM!`
+            // ✅ Simulated transaction (you can replace with real transaction later)
+            signature: `SIMULATED_CLAIM_${claimId}`,
+            message: `🎉 Successfully claimed ${claimAmount.toFixed(4)} $CHUM!`
         });
     } catch (error) {
         console.error(`❌ Claim error:`, error);
@@ -425,20 +529,73 @@ app.post('/api/claim-rewards', async (req, res) => {
     }
 });
 
-// Get player stats
+// ✅ ENHANCED: Get player stats with detailed breakdown
 app.get('/api/player/:wallet', async (req, res) => {
     try {
-        const record = playerRecords.get(req.params.wallet);
+        const wallet = req.params.wallet;
+        const record = playerRecords.get(wallet);
         
         if (!record) {
             return res.status(404).json({ 
-                error: 'Player not found'
+                error: 'Player not found',
+                message: 'No game history for this wallet'
             });
         }
 
-        res.json(record);
+        // ✅ Get recent games (last 10)
+        const recentGames = record.earnHistory
+            .slice(-10)
+            .reverse()
+            .map(entry => ({
+                sessionId: entry.sessionId,
+                points: entry.points,
+                chumEarned: parseFloat(entry.chumEarned.toFixed(4)),
+                timestamp: entry.timestamp,
+                claimed: entry.claimed,
+                claimedAt: entry.claimedAt || null
+            }));
+
+        res.json({
+            wallet: record.wallet,
+            balance: record.balance,
+            totalEarned: parseFloat(record.totalEarned.toFixed(4)),
+            totalClaimed: parseFloat(record.totalClaimed.toFixed(4)),
+            pendingRewards: parseFloat(record.pendingRewards.toFixed(4)),
+            gamesPlayed: record.gamesPlayed,
+            lastGameAt: record.lastGameAt,
+            lastClaimAt: record.lastClaimAt,
+            verifiedAt: record.verifiedAt,
+            recentGames
+        });
     } catch (error) {
         console.error('Stats error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ✅ NEW: Get leaderboard
+app.get('/api/leaderboard', (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 10;
+        
+        const leaderboard = Array.from(playerRecords.values())
+            .filter(p => p.totalEarned > 0)
+            .sort((a, b) => b.totalEarned - a.totalEarned)
+            .slice(0, limit)
+            .map((p, index) => ({
+                rank: index + 1,
+                wallet: `${p.wallet.slice(0, 4)}...${p.wallet.slice(-4)}`,
+                totalEarned: parseFloat(p.totalEarned.toFixed(4)),
+                gamesPlayed: p.gamesPlayed,
+                lastGameAt: p.lastGameAt
+            }));
+
+        res.json({
+            leaderboard,
+            totalPlayers: playerRecords.size
+        });
+    } catch (error) {
+        console.error('Leaderboard error:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -452,6 +609,7 @@ if (process.env.VERCEL !== '1') {
         console.log(`💎 $CHUM Mint: ${CHUM_MINT}`);
         console.log(`🎮 Min Hold: ${MIN_HOLD_REQUIREMENT.toLocaleString()} $CHUM`);
         console.log(`🎯 Conversion: ${POINTS_PER_CHUM.toLocaleString()} points = 1 $CHUM`);
+        console.log(`💰 Rewards: Accumulate & claim when ready!`);
     });
 }
 
