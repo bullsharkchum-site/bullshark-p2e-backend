@@ -447,10 +447,10 @@ app.post('/api/record-game', async (req, res) => {
     }
 });
 
-// ✅ NEW: Claim accumulated rewards
+// ✅ ENHANCED: Claim accumulated rewards (with partial claim support)
 app.post('/api/claim-rewards', async (req, res) => {
     try {
-        const { playerWallet } = req.body;
+        const { playerWallet, claimAmount } = req.body;
 
         if (!playerWallet) {
             return res.status(400).json({ error: 'Player wallet required' });
@@ -488,37 +488,86 @@ app.post('/api/claim-rewards', async (req, res) => {
             });
         }
 
-        // ✅ Process claim
-        const claimAmount = playerRecord.pendingRewards;
+        // ✅ Determine claim amount (partial or full)
+        let amountToClaim;
+        
+        if (claimAmount && claimAmount > 0) {
+            // Partial claim requested
+            if (claimAmount > playerRecord.pendingRewards) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'INSUFFICIENT_PENDING',
+                    pendingRewards: playerRecord.pendingRewards,
+                    requested: claimAmount,
+                    message: `Only ${playerRecord.pendingRewards.toFixed(4)} $CHUM available to claim`
+                });
+            }
+            amountToClaim = claimAmount;
+        } else {
+            // Claim all pending
+            amountToClaim = playerRecord.pendingRewards;
+        }
+
         const claimId = `claim_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-        playerRecord.totalClaimed += claimAmount;
-        playerRecord.pendingRewards = 0;
+        // ✅ Update totals
+        playerRecord.totalClaimed += amountToClaim;
+        playerRecord.pendingRewards -= amountToClaim;
         playerRecord.lastClaimAt = Date.now();
         
-        // ✅ Mark all pending games as claimed
-        playerRecord.earnHistory.forEach(entry => {
-            if (!entry.claimed) {
-                entry.claimed = true;
-                entry.claimedAt = Date.now();
-                entry.claimId = claimId;
+        // ✅ Mark games as claimed (proportionally if partial claim)
+        let remainingToMark = amountToClaim;
+        for (let entry of playerRecord.earnHistory) {
+            if (!entry.claimed && remainingToMark > 0) {
+                if (entry.chumEarned <= remainingToMark) {
+                    // Claim entire game
+                    entry.claimed = true;
+                    entry.claimedAt = Date.now();
+                    entry.claimId = claimId;
+                    remainingToMark -= entry.chumEarned;
+                } else {
+                    // Partial claim from this game (split it)
+                    const originalEarned = entry.chumEarned;
+                    
+                    // Mark original as claimed with partial amount
+                    entry.claimed = true;
+                    entry.claimedAt = Date.now();
+                    entry.claimId = claimId;
+                    entry.claimedAmount = remainingToMark;
+                    entry.remainingAmount = originalEarned - remainingToMark;
+                    
+                    // Create new entry for unclaimed portion
+                    playerRecord.earnHistory.push({
+                        sessionId: `${entry.sessionId}_remaining`,
+                        points: Math.floor((entry.remainingAmount / originalEarned) * entry.points),
+                        chumEarned: entry.remainingAmount,
+                        timestamp: entry.timestamp,
+                        claimed: false,
+                        isRemainder: true,
+                        originalSessionId: entry.sessionId
+                    });
+                    
+                    remainingToMark = 0;
+                    break;
+                }
             }
-        });
+        }
 
-        console.log(`💰 ${playerWallet.slice(0,4)}... claimed ${claimAmount.toFixed(4)} $CHUM`);
+        console.log(`💰 ${playerWallet.slice(0,4)}... claimed ${amountToClaim.toFixed(4)} $CHUM`);
+        console.log(`   Pending remaining: ${playerRecord.pendingRewards.toFixed(4)} $CHUM`);
         console.log(`   Total claimed: ${playerRecord.totalClaimed.toFixed(4)} $CHUM`);
         
         res.json({
             success: true,
             claimId,
-            claimAmount: parseFloat(claimAmount.toFixed(4)),
+            claimAmount: parseFloat(amountToClaim.toFixed(4)),
+            remainingPending: parseFloat(playerRecord.pendingRewards.toFixed(4)),
             totalClaimed: parseFloat(playerRecord.totalClaimed.toFixed(4)),
             totalEarned: parseFloat(playerRecord.totalEarned.toFixed(4)),
-            pendingRewards: 0,
             timestamp: Date.now(),
-            // ✅ Simulated transaction (you can replace with real transaction later)
+            // ✅ Simulated transaction
             signature: `SIMULATED_CLAIM_${claimId}`,
-            message: `🎉 Successfully claimed ${claimAmount.toFixed(4)} $CHUM!`
+            message: `🎉 Successfully claimed ${amountToClaim.toFixed(4)} $CHUM! ${playerRecord.pendingRewards > 0 ? `${playerRecord.pendingRewards.toFixed(4)} $CHUM still pending.` : ''}`
         });
     } catch (error) {
         console.error(`❌ Claim error:`, error);
@@ -528,6 +577,34 @@ app.post('/api/claim-rewards', async (req, res) => {
         });
     }
 });
+```
+
+---
+
+## 📊 **How It Works Now:**
+
+### **Example Scenario:**
+```
+Player has: 10,000 $CHUM pending
+
+Option 1: Claim ALL
+POST /api/claim-rewards
+{ "playerWallet": "EF5Zh..." }
+→ Claims all 10,000 $CHUM
+→ pendingRewards = 0
+
+Option 2: Claim PARTIAL
+POST /api/claim-rewards
+{ "playerWallet": "EF5Zh...", "claimAmount": 8000 }
+→ Claims 8,000 $CHUM
+→ pendingRewards = 2,000 $CHUM remaining
+
+Player plays more games:
+→ Earns 3,500 $CHUM
+→ pendingRewards = 2,000 + 3,500 = 5,500 $CHUM
+
+Next claim:
+→ Can claim some or all of 5,500 $CHUM
 
 // ✅ ENHANCED: Get player stats with detailed breakdown
 app.get('/api/player/:wallet', async (req, res) => {
