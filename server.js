@@ -169,31 +169,56 @@ function getOrCreatePlayerRecord(wallet) {
   return playerRecords.get(wallet);
 }
 
+// ===== FIND ACTUAL TOKEN ACCOUNT (handles pump.fun non-standard ATAs) =====
+
+async function findTokenAccount(ownerAddress, mintAddress) {
+  const owner = new PublicKey(ownerAddress);
+  const mint = new PublicKey(mintAddress);
+  
+  // Try both token programs
+  for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+    try {
+      const resp = await connection.getParsedTokenAccountsByOwner(owner, { programId });
+      for (const a of resp.value) {
+        const info = a.account?.data?.parsed?.info;
+        if (!info || info.mint !== mint.toBase58()) continue;
+        const amt = info.tokenAmount || {};
+        const uiAmount = amt.uiAmountString ? Number(amt.uiAmountString) : Number(amt.uiAmount ?? 0);
+        const rawAmount = BigInt(amt.amount || '0');
+        if (rawAmount > 0n) {
+          return {
+            address: a.pubkey,
+            balance: uiAmount,
+            rawBalance: rawAmount,
+            decimals: amt.decimals || 6,
+            programId: programId
+          };
+        }
+      }
+    } catch (e) {
+      console.log(`⚠️ findTokenAccount error for program ${programId.toString().slice(0,8)}: ${e.message}`);
+    }
+  }
+  return null;
+}
+
 // ===== VAULT INFO HELPER =====
 
 async function getVaultInfo() {
   if (!authority) return { funded: false, error: 'Authority keypair not loaded' };
   
   try {
+    const tokenAccount = await findTokenAccount(authority.publicKey.toString(), CHUM_MINT);
     const mint = new PublicKey(CHUM_MINT);
-    const authorityAta = await getAssociatedTokenAddress(mint, authority.publicKey);
-    
-    let vaultBalance = 0;
-    try {
-      const accountInfo = await getAccount(connection, authorityAta);
-      // Get mint info for decimals
-      const mintInfo = await getMint(connection, mint);
-      vaultBalance = Number(accountInfo.amount) / Math.pow(10, mintInfo.decimals);
-    } catch (e) {
-      // ATA doesn't exist yet
-      vaultBalance = 0;
-    }
+    const standardAta = await getAssociatedTokenAddress(mint, authority.publicKey);
     
     return {
-      funded: vaultBalance > 0,
-      vaultBalance,
+      funded: tokenAccount ? tokenAccount.balance > 0 : false,
+      vaultBalance: tokenAccount ? tokenAccount.balance : 0,
       authorityWallet: authority.publicKey.toString(),
-      authorityAta: authorityAta.toString(),
+      authorityAta: standardAta.toString(),
+      actualTokenAccount: tokenAccount ? tokenAccount.address.toString() : null,
+      tokenProgram: tokenAccount ? tokenAccount.programId.toString() : null,
       mint: CHUM_MINT
     };
   } catch (error) {
@@ -381,77 +406,73 @@ app.post('/api/claim-rewards', async (req, res) => {
         const mint = new PublicKey(CHUM_MINT);
         const playerPubkey = new PublicKey(playerWallet);
 
-        // Get mint info for decimals
-        const mintInfo = await getMint(connection, mint);
-        const decimals = mintInfo.decimals;
-        const rawAmount = BigInt(Math.floor(amountToClaim * Math.pow(10, decimals)));
-
-        console.log(`💰 Building claim TX: ${amountToClaim.toFixed(4)} $CHUM (${rawAmount} raw, ${decimals} decimals)`);
-        console.log(`   From: ${authority.publicKey.toString()}`);
-        console.log(`   To: ${playerWallet}`);
-
-        // Get authority's ATA (source vault)
-        const authorityAta = await getAssociatedTokenAddress(mint, authority.publicKey);
+        // Find authority's actual token account (handles pump.fun non-standard ATAs)
+        const vaultAccount = await findTokenAccount(authority.publicKey.toString(), CHUM_MINT);
         
-        // Check authority vault has enough tokens
-        let vaultBalance;
-        try {
-            const vaultAccount = await getAccount(connection, authorityAta);
-            vaultBalance = vaultAccount.amount;
-        } catch (e) {
+        if (!vaultAccount) {
             return res.status(500).json({
                 success: false,
                 error: 'VAULT_NOT_FUNDED',
-                message: 'Reward vault has no tokens. Admin needs to fund it.',
-                authorityWallet: authority.publicKey.toString(),
-                authorityAta: authorityAta.toString()
+                message: 'Reward vault has no $CHUM tokens. Admin needs to fund it.',
+                authorityWallet: authority.publicKey.toString()
             });
         }
 
-        if (vaultBalance < rawAmount) {
-            const vaultUi = Number(vaultBalance) / Math.pow(10, decimals);
+        const decimals = vaultAccount.decimals;
+        const rawAmount = BigInt(Math.floor(amountToClaim * Math.pow(10, decimals)));
+
+        console.log(`💰 Building claim TX: ${amountToClaim.toFixed(4)} $CHUM (${rawAmount} raw, ${decimals} decimals)`);
+        console.log(`   From: ${authority.publicKey.toString()} (account: ${vaultAccount.address.toString()})`);
+        console.log(`   To: ${playerWallet}`);
+        console.log(`   Vault balance: ${vaultAccount.balance} $CHUM (raw: ${vaultAccount.rawBalance})`);
+        console.log(`   Token program: ${vaultAccount.programId.toString()}`);
+
+        if (vaultAccount.rawBalance < rawAmount) {
             return res.status(500).json({
                 success: false,
                 error: 'VAULT_INSUFFICIENT',
-                message: `Vault only has ${vaultUi.toFixed(4)} $CHUM, need ${amountToClaim.toFixed(4)}`,
-                vaultBalance: vaultUi
+                message: `Vault only has ${vaultAccount.balance.toFixed(4)} $CHUM, need ${amountToClaim.toFixed(4)}`,
+                vaultBalance: vaultAccount.balance
             });
         }
 
-        // Get or create player's ATA (destination)
-        const playerAta = await getAssociatedTokenAddress(mint, playerPubkey);
+        // Get or create player's ATA (destination) - use same token program as source
+        const playerAta = await getAssociatedTokenAddress(
+            mint, 
+            playerPubkey, 
+            false,
+            vaultAccount.programId  // Use same token program as the vault
+        );
 
         // Build transaction
         const transaction = new Transaction();
 
         // Check if player ATA exists, if not add create instruction
-        let playerAtaExists = false;
         try {
-            await getAccount(connection, playerAta);
-            playerAtaExists = true;
+            await getAccount(connection, playerAta, 'confirmed', vaultAccount.programId);
         } catch (e) {
             // ATA doesn't exist, need to create it
             console.log(`   Creating ATA for player: ${playerAta.toString()}`);
             transaction.add(
                 createAssociatedTokenAccountInstruction(
-                    playerPubkey,    // payer (player pays for their own ATA)
-                    playerAta,       // ata address
-                    playerPubkey,    // owner
-                    mint             // mint
+                    playerPubkey,          // payer (player pays for their own ATA)
+                    playerAta,             // ata address
+                    playerPubkey,          // owner
+                    mint,                  // mint
+                    vaultAccount.programId // token program
                 )
             );
         }
 
         // Add the SPL token transfer instruction
-        // Authority transfers from their ATA to player's ATA
         transaction.add(
             createTransferInstruction(
-                authorityAta,          // source (authority's token account)
-                playerAta,             // destination (player's token account)
-                authority.publicKey,   // owner of source (authority signs)
-                rawAmount,             // amount in raw units
-                [],                    // no multisig
-                SPL_TOKEN_PROGRAM_ID   // token program
+                vaultAccount.address,    // source (authority's actual token account)
+                playerAta,               // destination (player's token account)
+                authority.publicKey,     // owner of source (authority signs)
+                rawAmount,               // amount in raw units
+                [],                      // no multisig
+                vaultAccount.programId   // use same token program as source
             )
         );
 
