@@ -482,10 +482,10 @@ app.post('/api/claim-rewards', async (req, res) => {
         transaction.lastValidBlockHeight = lastValidBlockHeight;
         transaction.feePayer = playerPubkey; // Player pays gas
 
-        // Authority partially signs the transaction
-        transaction.partialSign(authority);
+        // DO NOT sign here — Phantom must sign FIRST, then authority co-signs after
+        // This is the signing order Phantom's Lighthouse security requires
 
-        // Serialize the transaction (with requireAllSignatures: false since player hasn't signed yet)
+        // Serialize the transaction unsigned
         const serializedTx = transaction.serialize({
             requireAllSignatures: false,
             verifySignatures: false
@@ -494,7 +494,7 @@ app.post('/api/claim-rewards', async (req, res) => {
         const claimId = `claim_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
         // DON'T update records yet - wait for /api/confirm-claim after tx confirms
-        console.log(`✅ Claim TX built: ${claimId} | ${amountToClaim.toFixed(4)} $CHUM -> ${playerWallet.slice(0,8)}...`);
+        console.log(`✅ Claim TX built (unsigned): ${claimId} | ${amountToClaim.toFixed(4)} $CHUM -> ${playerWallet.slice(0,8)}...`);
 
         res.json({
             success: true,
@@ -507,6 +507,40 @@ app.post('/api/claim-rewards', async (req, res) => {
         });
     } catch (error) {
         console.error('❌ Claim error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ===== CO-SIGN CLAIM - Player signed first, now authority adds signature =====
+app.post('/api/cosign-claim', async (req, res) => {
+    try {
+        const { signedTransaction } = req.body;
+        if (!signedTransaction) {
+            return res.status(400).json({ error: 'Missing signedTransaction' });
+        }
+
+        if (!authority) {
+            return res.status(500).json({ error: 'Authority not configured' });
+        }
+
+        // Deserialize the player-signed transaction
+        const txBuffer = Buffer.from(signedTransaction, 'base64');
+        const transaction = Transaction.from(txBuffer);
+
+        // Authority co-signs AFTER Phantom (correct order per Phantom Lighthouse)
+        transaction.partialSign(authority);
+
+        // Serialize the fully-signed transaction
+        const fullySigned = transaction.serialize().toString('base64');
+
+        console.log(`✅ Authority co-signed claim transaction`);
+
+        res.json({
+            success: true,
+            transaction: fullySigned
+        });
+    } catch (error) {
+        console.error('❌ Co-sign error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
