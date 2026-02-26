@@ -20,7 +20,8 @@ app.use(express.json());
 const RPC_URL = process.env.RPC_URL || 'https://mainnet.helius-rpc.com/?api-key=64ae06e8-606e-4e6d-8c79-bb210ae08977';
 const CHUM_MINT = process.env.CHUM_MINT || 'B9nLmgbkW9X59xvwne1Z7qfJ46AsAmNEydMiJrgxpump';
 const MIN_HOLD_REQUIREMENT = parseInt(process.env.MIN_HOLD_REQUIREMENT || '25000');
-const POINTS_PER_CHUM = 3000;
+const ADMIN_KEY = process.env.ADMIN_KEY || 'bullshark2025admin';
+const POINTS_PER_CHUM = 1000; // Updated: 1,000 pts = 1 $CHUM
 
 // Token Program IDs for balance checking
 const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
@@ -427,47 +428,56 @@ app.post('/api/verify-eligibility', async (req, res) => {
     }
 });
 
-// Record game results
+// Record game results (tournament-only P2E model)
 app.post('/api/record-game', async (req, res) => {
     try {
         const { playerWallet, points, finalScore } = req.body;
         if (!playerWallet || !points) return res.status(400).json({ error: 'Missing required fields' });
-        if (points < POINTS_PER_CHUM) {
-            return res.json({ success: false, message: `Need at least ${POINTS_PER_CHUM.toLocaleString()} points to earn $CHUM` });
-        }
 
-        const chumBalance = await getComprehensiveTokenBalance(playerWallet, CHUM_MINT);
-        if (chumBalance < MIN_HOLD_REQUIREMENT) {
-            return res.json({ success: false, error: 'INSUFFICIENT_BALANCE', balance: chumBalance, required: MIN_HOLD_REQUIREMENT });
-        }
-
-        const chumEarned = points / POINTS_PER_CHUM;
         const sessionId = `game_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        const score = finalScore || points;
 
-        gameSessions.set(sessionId, {
-            sessionId, player: playerWallet, points, finalScore: finalScore || points,
-            chumEarned, timestamp: Date.now(), claimed: false
-        });
-
+        // Always update player stats (practice or tournament)
         const playerRecord = await getOrCreatePlayerRecord(playerWallet);
-        playerRecord.totalEarned += chumEarned;
-        playerRecord.pendingRewards += chumEarned;
         playerRecord.gamesPlayed += 1;
         playerRecord.lastGameAt = Date.now();
-        playerRecord.balance = chumBalance;
-        playerRecord.earnHistory.push({ sessionId, points, chumEarned, timestamp: Date.now(), claimed: false });
+
+        // Check if tournament is active and player is registered
+        let tournamentRecorded = false;
+        let tournamentBestScore = 0;
+        let tournamentGamesPlayed = 0;
+
+        if (currentTournament && currentTournament.active && Date.now() <= currentTournament.endTime) {
+            if (currentTournament.registrations[playerWallet]) {
+                tournamentRecorded = await recordTournamentScore(playerWallet, score);
+                tournamentBestScore = currentTournament.scores[playerWallet]?.bestScore || 0;
+                tournamentGamesPlayed = currentTournament.scores[playerWallet]?.gamesPlayed || 0;
+                console.log(`🏆 Tournament score: ${playerWallet.slice(0,4)}... = ${score} pts (best: ${tournamentBestScore})`);
+            }
+        }
+
         await savePlayerRecord(playerWallet, playerRecord);
 
-        console.log(`🎮 ${playerWallet.slice(0,4)}... earned ${chumEarned.toFixed(4)} $CHUM (pending: ${playerRecord.pendingRewards.toFixed(4)})`);
-        
+        console.log(`🎮 ${playerWallet.slice(0,4)}... scored ${score} pts | Tournament: ${tournamentRecorded ? 'YES' : 'practice'}`);
+
         res.json({
-            success: true, sessionId, points,
-            chumEarned: parseFloat(chumEarned.toFixed(4)),
-            pendingRewards: parseFloat(playerRecord.pendingRewards.toFixed(4)),
-            totalEarned: parseFloat(playerRecord.totalEarned.toFixed(4)),
-            totalClaimed: parseFloat(playerRecord.totalClaimed.toFixed(4)),
+            success: true,
+            sessionId,
+            points: score,
             gamesPlayed: playerRecord.gamesPlayed,
-            message: `🦈 You earned ${chumEarned.toFixed(4)} $CHUM! Total pending: ${playerRecord.pendingRewards.toFixed(4)}`
+            // Tournament info
+            tournamentActive: !!(currentTournament?.active && Date.now() <= currentTournament?.endTime),
+            tournamentRegistered: !!(currentTournament?.registrations?.[playerWallet]),
+            tournamentScoreRecorded: tournamentRecorded,
+            tournamentBestScore,
+            tournamentGamesPlayed,
+            // Existing rewards (from past tournaments)
+            pendingRewards: parseFloat((playerRecord.pendingRewards || 0).toFixed(4)),
+            totalEarned: parseFloat((playerRecord.totalEarned || 0).toFixed(4)),
+            totalClaimed: parseFloat((playerRecord.totalClaimed || 0).toFixed(4)),
+            message: tournamentRecorded
+                ? `🏆 Tournament score: ${score} pts! Best: ${tournamentBestScore}`
+                : `🎮 Practice score: ${score} pts`
         });
     } catch (error) {
         console.error('Record game error:', error);
@@ -794,6 +804,494 @@ app.get('/api/leaderboard', (req, res) => {
     }
 });
 
+// ===== TOURNAMENT SYSTEM =====
+
+// Tournament state (cached in memory, persisted to Firebase)
+let currentTournament = null;
+
+// Default prize tiers (769,230 $CHUM per week from 80M/104 weeks)
+const DEFAULT_PRIZE_TIERS = [
+    { rank: 1, amount: 150000 },
+    { rank: 2, amount: 80000 },
+    { rank: 3, amount: 50000 },
+    { rank: 4, amount: 30000 },
+    { rank: 5, amount: 20000 },
+    { rank: 6, amount: 10000 },
+    { rank: 7, amount: 10000 },
+    { rank: 8, amount: 10000 },
+    { rank: 9, amount: 10000 },
+    { rank: 10, amount: 10000 },
+    // 11-25: 4,000 each
+    // 26-50: 2,500 each
+    // 51-100: 1,500 each
+    // Top 50% of rest: 500 each
+    // All participants: split remainder
+];
+
+// Load tournament state from Firebase on startup
+async function loadTournamentState() {
+    const data = await firebaseLoad('tournaments/current');
+    if (data && data.active) {
+        currentTournament = data;
+        // Ensure scores object exists
+        if (!currentTournament.scores) currentTournament.scores = {};
+        if (!currentTournament.registrations) currentTournament.registrations = {};
+        console.log(`🏆 Active tournament loaded: ${currentTournament.name} (${Object.keys(currentTournament.registrations).length} players)`);
+    } else {
+        console.log('🎮 No active tournament');
+    }
+}
+loadTournamentState();
+
+// Admin auth middleware
+function adminAuth(req, res, next) {
+    const key = req.query.key || req.body?.key || req.headers['x-admin-key'];
+    if (key !== ADMIN_KEY) {
+        return res.status(403).json({ error: 'Invalid admin key' });
+    }
+    next();
+}
+
+// ===== ADMIN ENDPOINTS =====
+
+// Start tournament
+app.post('/admin/tournament/start', adminAuth, async (req, res) => {
+    try {
+        if (currentTournament && currentTournament.active) {
+            return res.status(400).json({ error: 'Tournament already active', tournament: currentTournament.name });
+        }
+
+        const { name, duration, prizePool } = req.body;
+        const durationHours = duration || 24;
+        const pool = prizePool || 769230;
+
+        const tournamentId = `tournament_${Date.now()}`;
+        const startTime = Date.now();
+        const endTime = startTime + (durationHours * 60 * 60 * 1000);
+
+        currentTournament = {
+            id: tournamentId,
+            name: name || `BullShark Weekly Tournament`,
+            active: true,
+            startTime,
+            endTime,
+            durationHours,
+            prizePool: pool,
+            registrations: {},
+            scores: {},
+            createdAt: startTime
+        };
+
+        await firebaseSave('tournaments/current', currentTournament);
+        console.log(`🏆 Tournament started: ${currentTournament.name} | ${durationHours}hrs | ${pool.toLocaleString()} $CHUM pool`);
+
+        res.json({
+            success: true,
+            tournament: {
+                id: tournamentId,
+                name: currentTournament.name,
+                startTime: new Date(startTime).toISOString(),
+                endTime: new Date(endTime).toISOString(),
+                durationHours,
+                prizePool: pool
+            }
+        });
+    } catch (error) {
+        console.error('Tournament start error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Stop tournament + calculate results
+app.post('/admin/tournament/stop', adminAuth, async (req, res) => {
+    try {
+        if (!currentTournament || !currentTournament.active) {
+            return res.status(400).json({ error: 'No active tournament' });
+        }
+
+        // Calculate final rankings
+        const results = calculateTournamentResults(currentTournament);
+
+        // Save to history
+        const historyEntry = {
+            ...currentTournament,
+            active: false,
+            endedAt: Date.now(),
+            results
+        };
+        await firebaseSave(`tournaments/history/${currentTournament.id}`, historyEntry);
+
+        // Award prizes to player records (pending rewards)
+        for (const winner of results.winners) {
+            if (winner.prize > 0) {
+                const playerRecord = await getOrCreatePlayerRecord(winner.wallet);
+                playerRecord.totalEarned += winner.prize;
+                playerRecord.pendingRewards += winner.prize;
+                playerRecord.earnHistory.push({
+                    sessionId: `tournament_${currentTournament.id}`,
+                    points: winner.bestScore,
+                    chumEarned: winner.prize,
+                    timestamp: Date.now(),
+                    claimed: false,
+                    tournamentPrize: true,
+                    tournamentName: currentTournament.name,
+                    rank: winner.rank
+                });
+                await savePlayerRecord(winner.wallet, playerRecord);
+            }
+        }
+
+        console.log(`🏆 Tournament ended: ${currentTournament.name} | ${results.winners.length} winners`);
+
+        // Clear current tournament
+        currentTournament = null;
+        await firebaseSave('tournaments/current', { active: false });
+
+        res.json({
+            success: true,
+            message: 'Tournament ended and prizes awarded to pending rewards',
+            results
+        });
+    } catch (error) {
+        console.error('Tournament stop error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Admin tournament status
+app.get('/admin/tournament/status', adminAuth, async (req, res) => {
+    if (!currentTournament || !currentTournament.active) {
+        return res.json({ active: false, message: 'No active tournament' });
+    }
+
+    const timeRemaining = Math.max(0, currentTournament.endTime - Date.now());
+    const registeredCount = Object.keys(currentTournament.registrations).length;
+    const scoresCount = Object.keys(currentTournament.scores).length;
+
+    res.json({
+        active: true,
+        tournament: {
+            id: currentTournament.id,
+            name: currentTournament.name,
+            startTime: new Date(currentTournament.startTime).toISOString(),
+            endTime: new Date(currentTournament.endTime).toISOString(),
+            timeRemainingMs: timeRemaining,
+            timeRemainingHuman: formatTime(timeRemaining),
+            prizePool: currentTournament.prizePool,
+            registeredPlayers: registeredCount,
+            playersWithScores: scoresCount
+        },
+        topScores: getTopScores(currentTournament, 20)
+    });
+});
+
+// Admin: view tournament history
+app.get('/admin/tournament/history', adminAuth, async (req, res) => {
+    try {
+        const history = await firebaseLoad('tournaments/history');
+        if (!history) return res.json({ tournaments: [] });
+        
+        const tournaments = Object.values(history)
+            .sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0))
+            .slice(0, 20)
+            .map(t => ({
+                id: t.id,
+                name: t.name,
+                startTime: new Date(t.startTime).toISOString(),
+                endedAt: t.endedAt ? new Date(t.endedAt).toISOString() : null,
+                prizePool: t.prizePool,
+                totalPlayers: Object.keys(t.registrations || {}).length,
+                topWinners: t.results?.winners?.slice(0, 5) || []
+            }));
+        
+        res.json({ tournaments });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ===== PUBLIC TOURNAMENT ENDPOINTS =====
+
+// Public tournament status
+app.get('/api/tournament/status', (req, res) => {
+    if (!currentTournament || !currentTournament.active) {
+        return res.json({ active: false });
+    }
+
+    const timeRemaining = Math.max(0, currentTournament.endTime - Date.now());
+    const isExpired = timeRemaining <= 0;
+
+    res.json({
+        active: !isExpired,
+        id: currentTournament.id,
+        name: currentTournament.name,
+        startTime: currentTournament.startTime,
+        endTime: currentTournament.endTime,
+        timeRemainingMs: timeRemaining,
+        timeRemainingHuman: formatTime(timeRemaining),
+        prizePool: currentTournament.prizePool,
+        registeredPlayers: Object.keys(currentTournament.registrations).length,
+        playersWithScores: Object.keys(currentTournament.scores).length
+    });
+});
+
+// Register for tournament
+app.post('/api/tournament/register', async (req, res) => {
+    try {
+        const { playerWallet } = req.body;
+        if (!playerWallet) return res.status(400).json({ error: 'Wallet required' });
+
+        if (!currentTournament || !currentTournament.active) {
+            return res.json({ success: false, error: 'NO_ACTIVE_TOURNAMENT', message: 'No tournament is currently active' });
+        }
+
+        // Check if tournament time expired
+        if (Date.now() > currentTournament.endTime) {
+            return res.json({ success: false, error: 'TOURNAMENT_ENDED', message: 'Tournament has ended' });
+        }
+
+        // Check if already registered
+        if (currentTournament.registrations[playerWallet]) {
+            return res.json({ success: true, message: 'Already registered', alreadyRegistered: true });
+        }
+
+        // Verify holds minimum $CHUM
+        const chumBalance = await getComprehensiveTokenBalance(playerWallet, CHUM_MINT);
+        if (chumBalance < MIN_HOLD_REQUIREMENT) {
+            return res.json({
+                success: false,
+                error: 'INSUFFICIENT_BALANCE',
+                balance: chumBalance,
+                required: MIN_HOLD_REQUIREMENT,
+                message: `Need ${MIN_HOLD_REQUIREMENT.toLocaleString()} $CHUM to enter tournament`
+            });
+        }
+
+        // Register
+        currentTournament.registrations[playerWallet] = {
+            registeredAt: Date.now(),
+            balance: chumBalance
+        };
+
+        await firebaseSave('tournaments/current', currentTournament);
+        console.log(`🏆 ${playerWallet.slice(0, 8)}... registered for tournament (${Object.keys(currentTournament.registrations).length} total)`);
+
+        res.json({
+            success: true,
+            message: `Registered for ${currentTournament.name}!`,
+            tournamentName: currentTournament.name,
+            endTime: currentTournament.endTime,
+            prizePool: currentTournament.prizePool
+        });
+    } catch (error) {
+        console.error('Tournament register error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Tournament leaderboard (public)
+app.get('/api/tournament/leaderboard', (req, res) => {
+    if (!currentTournament || !currentTournament.active) {
+        return res.json({ active: false, leaderboard: [] });
+    }
+
+    const leaderboard = getTopScores(currentTournament, parseInt(req.query.limit) || 50);
+    const timeRemaining = Math.max(0, currentTournament.endTime - Date.now());
+
+    res.json({
+        active: true,
+        tournamentName: currentTournament.name,
+        timeRemainingMs: timeRemaining,
+        timeRemainingHuman: formatTime(timeRemaining),
+        prizePool: currentTournament.prizePool,
+        totalPlayers: Object.keys(currentTournament.registrations).length,
+        leaderboard
+    });
+});
+
+// Check if player is registered for current tournament
+app.get('/api/tournament/check/:wallet', (req, res) => {
+    const wallet = req.params.wallet;
+    
+    if (!currentTournament || !currentTournament.active) {
+        return res.json({ active: false, registered: false });
+    }
+
+    const isRegistered = !!currentTournament.registrations[wallet];
+    const playerScore = currentTournament.scores[wallet];
+    const timeRemaining = Math.max(0, currentTournament.endTime - Date.now());
+
+    res.json({
+        active: true,
+        registered: isRegistered,
+        tournamentName: currentTournament.name,
+        timeRemainingMs: timeRemaining,
+        timeRemainingHuman: formatTime(timeRemaining),
+        prizePool: currentTournament.prizePool,
+        bestScore: playerScore?.bestScore || 0,
+        gamesPlayed: playerScore?.gamesPlayed || 0
+    });
+});
+
+// Past tournament results (public)
+app.get('/api/tournament/results/:tournamentId', async (req, res) => {
+    try {
+        const data = await firebaseLoad(`tournaments/history/${req.params.tournamentId}`);
+        if (!data) return res.status(404).json({ error: 'Tournament not found' });
+
+        res.json({
+            id: data.id,
+            name: data.name,
+            startTime: data.startTime,
+            endedAt: data.endedAt,
+            prizePool: data.prizePool,
+            totalPlayers: Object.keys(data.registrations || {}).length,
+            results: data.results
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Past tournaments list (public)
+app.get('/api/tournament/history', async (req, res) => {
+    try {
+        const history = await firebaseLoad('tournaments/history');
+        if (!history) return res.json({ tournaments: [] });
+        
+        const tournaments = Object.values(history)
+            .sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0))
+            .slice(0, 20)
+            .map(t => ({
+                id: t.id,
+                name: t.name,
+                startTime: t.startTime,
+                endedAt: t.endedAt,
+                prizePool: t.prizePool,
+                totalPlayers: Object.keys(t.registrations || {}).length,
+                topWinners: (t.results?.winners || []).slice(0, 3).map(w => ({
+                    rank: w.rank,
+                    wallet: `${w.wallet.slice(0, 4)}...${w.wallet.slice(-4)}`,
+                    bestScore: w.bestScore,
+                    prize: w.prize
+                }))
+            }));
+        
+        res.json({ tournaments });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ===== TOURNAMENT HELPER FUNCTIONS =====
+
+function formatTime(ms) {
+    if (ms <= 0) return 'Ended';
+    const hours = Math.floor(ms / (1000 * 60 * 60));
+    const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+}
+
+function getTopScores(tournament, limit) {
+    if (!tournament.scores) return [];
+    return Object.entries(tournament.scores)
+        .map(([wallet, data]) => ({
+            wallet: `${wallet.slice(0, 4)}...${wallet.slice(-4)}`,
+            fullWallet: wallet,
+            bestScore: data.bestScore,
+            gamesPlayed: data.gamesPlayed,
+            lastGameAt: data.lastGameAt
+        }))
+        .sort((a, b) => b.bestScore - a.bestScore)
+        .slice(0, limit)
+        .map((entry, index) => ({ rank: index + 1, ...entry }));
+}
+
+function calculateTournamentResults(tournament) {
+    const ranked = getTopScores(tournament, 99999);
+    const totalPlayers = ranked.length;
+    const pool = tournament.prizePool;
+    const winners = [];
+
+    let distributed = 0;
+
+    for (let i = 0; i < ranked.length; i++) {
+        const rank = i + 1;
+        let prize = 0;
+
+        // Top 10: fixed prizes
+        if (rank === 1) prize = Math.floor(pool * 0.195);
+        else if (rank === 2) prize = Math.floor(pool * 0.104);
+        else if (rank === 3) prize = Math.floor(pool * 0.065);
+        else if (rank === 4) prize = Math.floor(pool * 0.039);
+        else if (rank === 5) prize = Math.floor(pool * 0.026);
+        else if (rank <= 10) prize = Math.floor(pool * 0.013);
+        // 11-25
+        else if (rank <= 25) prize = Math.floor(pool * 0.0052);
+        // 26-50
+        else if (rank <= 50) prize = Math.floor(pool * 0.00325);
+        // 51-100
+        else if (rank <= 100) prize = Math.floor(pool * 0.00195);
+        // Top 50% of remaining
+        else if (rank <= Math.ceil(totalPlayers * 0.75)) prize = Math.floor(pool * 0.00065);
+        // Everyone else gets participation
+        else prize = Math.max(1, Math.floor(pool * 0.0001));
+
+        distributed += prize;
+        winners.push({
+            rank,
+            wallet: ranked[i].fullWallet,
+            walletShort: ranked[i].wallet,
+            bestScore: ranked[i].bestScore,
+            gamesPlayed: ranked[i].gamesPlayed,
+            prize: parseFloat(prize.toFixed(4))
+        });
+    }
+
+    return {
+        totalPlayers,
+        totalDistributed: distributed,
+        prizePool: pool,
+        winners
+    };
+}
+
+// Record tournament score (called from record-game when tournament is active)
+async function recordTournamentScore(wallet, points) {
+    if (!currentTournament || !currentTournament.active) return false;
+    if (!currentTournament.registrations[wallet]) return false;
+    if (Date.now() > currentTournament.endTime) return false;
+
+    if (!currentTournament.scores[wallet]) {
+        currentTournament.scores[wallet] = {
+            bestScore: 0,
+            gamesPlayed: 0,
+            allScores: [],
+            lastGameAt: null
+        };
+    }
+
+    const playerTourney = currentTournament.scores[wallet];
+    playerTourney.gamesPlayed += 1;
+    playerTourney.lastGameAt = Date.now();
+    playerTourney.allScores.push({ points, timestamp: Date.now() });
+    
+    // Keep only best score (single best score format)
+    if (points > playerTourney.bestScore) {
+        playerTourney.bestScore = points;
+    }
+
+    // Keep allScores manageable (last 100 games)
+    if (playerTourney.allScores.length > 100) {
+        playerTourney.allScores = playerTourney.allScores.slice(-100);
+    }
+
+    // Save to Firebase (async)
+    firebaseSave('tournaments/current', currentTournament);
+    return true;
+}
+
 const PORT = process.env.PORT || 3000;
 
 if (process.env.VERCEL !== '1') {
@@ -804,6 +1302,8 @@ if (process.env.VERCEL !== '1') {
         console.log(`🎮 Min Hold: ${MIN_HOLD_REQUIREMENT.toLocaleString()} $CHUM`);
         console.log(`🎯 Conversion: ${POINTS_PER_CHUM.toLocaleString()} points = 1 $CHUM`);
         console.log(`🔑 Authority: ${authority ? authority.publicKey.toString() : '❌ NOT LOADED'}`);
+        console.log(`🏆 Tournament mode: ${currentTournament?.active ? 'ACTIVE' : 'inactive'}`);
+        console.log(`🔐 Admin key: ${ADMIN_KEY ? 'SET' : '❌ NOT SET'}`);
         if (authority) {
             console.log(`\n💰 To fund the reward vault, send $CHUM to the authority wallet:`);
             console.log(`   ${authority.publicKey.toString()}`);
