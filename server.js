@@ -44,9 +44,110 @@ try {
 
 const connection = new Connection(RPC_URL, 'confirmed');
 
-// In-memory storage
+// ===== FIREBASE PERSISTENT STORAGE =====
+const FIREBASE_DB_URL = process.env.FIREBASE_DB_URL || 'https://bullshark-game-default-rtdb.firebaseio.com';
+
+// In-memory cache (backed by Firebase)
 const gameSessions = new Map();
 const playerRecords = new Map();
+
+// Firebase REST API helpers
+async function firebaseSave(path, data) {
+  if (!FIREBASE_DB_URL) {
+    console.warn('⚠️ FIREBASE_DB_URL not set — data will NOT persist across restarts!');
+    return;
+  }
+  try {
+    const url = `${FIREBASE_DB_URL}/p2e/${path}.json`;
+    const response = await fetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!response.ok) {
+      console.error(`Firebase save error (${path}):`, response.statusText);
+    }
+  } catch (err) {
+    console.error(`Firebase save error (${path}):`, err.message);
+  }
+}
+
+async function firebaseLoad(path) {
+  if (!FIREBASE_DB_URL) return null;
+  try {
+    const url = `${FIREBASE_DB_URL}/p2e/${path}.json`;
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data;
+  } catch (err) {
+    console.error(`Firebase load error (${path}):`, err.message);
+    return null;
+  }
+}
+
+// Save player record to both cache and Firebase
+async function savePlayerRecord(wallet, record) {
+  playerRecords.set(wallet, record);
+  // Save to Firebase (async, don't block the response)
+  // Limit earnHistory to last 200 entries to keep Firebase manageable
+  const toSave = { ...record };
+  if (toSave.earnHistory && toSave.earnHistory.length > 200) {
+    toSave.earnHistory = toSave.earnHistory.slice(-200);
+  }
+  firebaseSave(`players/${wallet}`, toSave);
+}
+
+// Load player from cache or Firebase
+async function loadPlayerRecord(wallet) {
+  // Check cache first
+  if (playerRecords.has(wallet)) {
+    return playerRecords.get(wallet);
+  }
+  // Try Firebase
+  const data = await firebaseLoad(`players/${wallet}`);
+  if (data) {
+    // Ensure earnHistory is an array (Firebase can convert arrays to objects)
+    if (data.earnHistory && !Array.isArray(data.earnHistory)) {
+      data.earnHistory = Object.values(data.earnHistory);
+    }
+    playerRecords.set(wallet, data);
+    return data;
+  }
+  return null;
+}
+
+// Load all players from Firebase on startup
+async function loadAllPlayersFromFirebase() {
+  if (!FIREBASE_DB_URL) {
+    console.log('⚠️ No FIREBASE_DB_URL — running with in-memory only (data lost on restart)');
+    return;
+  }
+  console.log('📂 Loading player data from Firebase...');
+  try {
+    const allPlayers = await firebaseLoad('players');
+    if (allPlayers && typeof allPlayers === 'object') {
+      let count = 0;
+      for (const [wallet, record] of Object.entries(allPlayers)) {
+        // Ensure earnHistory is an array
+        if (record.earnHistory && !Array.isArray(record.earnHistory)) {
+          record.earnHistory = Object.values(record.earnHistory);
+        }
+        if (!record.earnHistory) record.earnHistory = [];
+        playerRecords.set(wallet, record);
+        count++;
+      }
+      console.log(`✅ Loaded ${count} player records from Firebase`);
+    } else {
+      console.log('📂 No existing player data in Firebase');
+    }
+  } catch (err) {
+    console.error('❌ Failed to load from Firebase:', err.message);
+  }
+}
+
+// Start loading immediately
+loadAllPlayersFromFirebase();
 
 // ===== HELPER FUNCTIONS =====
 
@@ -151,22 +252,27 @@ async function getComprehensiveTokenBalance(walletAddress, tokenMint) {
   }
 }
 
-function getOrCreatePlayerRecord(wallet) {
-  if (!playerRecords.has(wallet)) {
-    playerRecords.set(wallet, {
-      wallet,
-      totalEarned: 0,
-      totalClaimed: 0,
-      pendingRewards: 0,
-      balance: 0,
-      gamesPlayed: 0,
-      lastGameAt: null,
-      lastClaimAt: null,
-      verifiedAt: null,
-      earnHistory: []
-    });
-  }
-  return playerRecords.get(wallet);
+async function getOrCreatePlayerRecord(wallet) {
+  // Check cache first, then Firebase
+  const existing = await loadPlayerRecord(wallet);
+  if (existing) return existing;
+
+  // Create new record
+  const newRecord = {
+    wallet,
+    totalEarned: 0,
+    totalClaimed: 0,
+    pendingRewards: 0,
+    balance: 0,
+    gamesPlayed: 0,
+    lastGameAt: null,
+    lastClaimAt: null,
+    verifiedAt: null,
+    earnHistory: []
+  };
+  playerRecords.set(wallet, newRecord);
+  await savePlayerRecord(wallet, newRecord);
+  return newRecord;
 }
 
 // ===== FIND ACTUAL TOKEN ACCOUNT (handles pump.fun non-standard ATAs) =====
@@ -261,7 +367,7 @@ app.get('/api/check-balance/:wallet', async (req, res) => {
         const chumBalance = await getComprehensiveTokenBalance(walletAddress, CHUM_MINT);
         const eligible = chumBalance >= MIN_HOLD_REQUIREMENT;
         const deficit = Math.max(0, MIN_HOLD_REQUIREMENT - chumBalance);
-        const playerRecord = playerRecords.get(walletAddress);
+        const playerRecord = await loadPlayerRecord(walletAddress);
         
         res.json({
             wallet: walletAddress,
@@ -301,9 +407,10 @@ app.post('/api/verify-eligibility', async (req, res) => {
             });
         }
         
-        const playerRecord = getOrCreatePlayerRecord(playerWallet);
+        const playerRecord = await getOrCreatePlayerRecord(playerWallet);
         playerRecord.balance = chumBalance;
         playerRecord.verifiedAt = Date.now();
+        await savePlayerRecord(playerWallet, playerRecord);
         
         res.json({
             eligible: true,
@@ -342,13 +449,14 @@ app.post('/api/record-game', async (req, res) => {
             chumEarned, timestamp: Date.now(), claimed: false
         });
 
-        const playerRecord = getOrCreatePlayerRecord(playerWallet);
+        const playerRecord = await getOrCreatePlayerRecord(playerWallet);
         playerRecord.totalEarned += chumEarned;
         playerRecord.pendingRewards += chumEarned;
         playerRecord.gamesPlayed += 1;
         playerRecord.lastGameAt = Date.now();
         playerRecord.balance = chumBalance;
         playerRecord.earnHistory.push({ sessionId, points, chumEarned, timestamp: Date.now(), claimed: false });
+        await savePlayerRecord(playerWallet, playerRecord);
 
         console.log(`🎮 ${playerWallet.slice(0,4)}... earned ${chumEarned.toFixed(4)} $CHUM (pending: ${playerRecord.pendingRewards.toFixed(4)})`);
         
@@ -383,7 +491,7 @@ app.post('/api/claim-rewards', async (req, res) => {
         }
 
         // Check player has pending rewards
-        const playerRecord = playerRecords.get(playerWallet);
+        const playerRecord = await loadPlayerRecord(playerWallet);
         if (!playerRecord || playerRecord.pendingRewards <= 0) {
             return res.json({ success: false, message: 'No pending rewards to claim', pendingRewards: 0 });
         }
@@ -596,7 +704,7 @@ app.post('/api/confirm-claim', async (req, res) => {
         }
 
         // Transaction confirmed! Now update player records
-        const playerRecord = playerRecords.get(playerWallet);
+        const playerRecord = await loadPlayerRecord(playerWallet);
         if (playerRecord) {
             const amount = claimAmount || playerRecord.pendingRewards;
             playerRecord.totalClaimed += amount;
@@ -618,6 +726,8 @@ app.post('/api/confirm-claim', async (req, res) => {
                     }
                 }
             }
+
+            await savePlayerRecord(playerWallet, playerRecord);
         }
 
         console.log(`✅ Claim confirmed! ${claimAmount?.toFixed(4)} $CHUM -> ${playerWallet.slice(0,8)}... | sig: ${signature.slice(0,20)}...`);
@@ -643,7 +753,7 @@ app.post('/api/confirm-claim', async (req, res) => {
 app.get('/api/player/:wallet', async (req, res) => {
     try {
         const wallet = req.params.wallet;
-        const record = playerRecords.get(wallet);
+        const record = await loadPlayerRecord(wallet);
         if (!record) return res.status(404).json({ error: 'Player not found' });
         const recentGames = record.earnHistory.slice(-10).reverse().map(entry => ({
             sessionId: entry.sessionId, points: entry.points,
